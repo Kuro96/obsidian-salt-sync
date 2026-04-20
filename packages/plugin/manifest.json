@@ -1,0 +1,10 @@
+{
+  "id": "salt-sync",
+  "name": "Salt Sync",
+  "version": "0.1.0",
+  "minAppVersion": "1.0.0",
+  "description": "Self-hosted real-time Obsidian sync with snapshot support",
+  "author": "salt-sync",
+  "authorUrl": "",
+  "isDesktopOnly": false
+}

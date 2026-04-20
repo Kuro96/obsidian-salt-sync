@@ -1,0 +1,24 @@
+{
+  "name": "salt-sync",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=22 <25"
+  },
+  "scripts": {
+    "build": "pnpm --filter @salt-sync/shared build && pnpm --filter @salt-sync/server build && pnpm --filter @salt-sync/plugin build",
+    "typecheck": "pnpm -r typecheck",
+    "clean": "pnpm -r clean",
+    "dev:server": "pnpm --filter @salt-sync/server dev",
+    "test": "pnpm -r test"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.0",
+    "vitest": "^4.1.4"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}

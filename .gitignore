@@ -1,0 +1,27 @@
+node_modules/
+dist/
+.env
+.env.local
+*.local
+
+# SQLite dev databases
+*.db
+*.db-shm
+*.db-wal
+
+# Obsidian plugin dev symlink target
+packages/plugin/.obsidian/
+
+# pnpm
+.pnpm-store/
+
+# Docker local runtime data
+docker/data/**
+!docker/data/*/
+!docker/data/*/.gitkeep
+
+PRD.md
+progress.md
+review.md
+
+tmp/

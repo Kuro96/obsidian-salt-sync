@@ -1,0 +1,63 @@
+/* ── Salt Sync plugin styles ─────────────────────────────────────────────── */
+
+/* 已添加的挂载条目 */
+.salt-sync-mount-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  margin: 4px 0;
+  border-radius: 6px;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+}
+
+.salt-sync-mount-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.salt-sync-mount-path {
+  font-family: var(--font-monospace);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.salt-sync-mount-meta {
+  font-size: 12px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.salt-sync-mount-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: 12px;
+}
+
+/* 添加挂载表单 */
+.salt-sync-mount-form {
+  padding: 6px 0;
+  border-radius: 6px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+  margin: 8px 0;
+}
+
+.salt-sync-error {
+  color: var(--text-error);
+  font-size: 13px;
+  padding: 4px 16px;
+}
+
+.salt-sync-form-actions {
+  display: flex;
+  gap: 8px;
+  padding: 8px 16px;
+}

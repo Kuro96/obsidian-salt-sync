@@ -1,0 +1,20 @@
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":19001"
+    ports:
+      - "19000:9000"    # S3 API
+      - "19001:19001"   # Web console
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  minio_data:

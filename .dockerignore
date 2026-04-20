@@ -1,0 +1,9 @@
+node_modules
+packages/*/node_modules
+packages/*/dist
+data
+docker/data
+.git
+.idea
+.vscode
+*.log

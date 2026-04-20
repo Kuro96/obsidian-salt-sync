@@ -1,0 +1,35 @@
+{
+  "name": "@salt-sync/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc && esbuild admin-src/main.tsx --bundle --outfile=dist/admin.js --minify --jsx=automatic --target=es2018",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1030.0",
+    "@salt-sync/shared": "workspace:*",
+    "ws": "^8.18.0",
+    "y-protocols": "^1.0.6",
+    "yazl": "^3.3.1",
+    "yjs": "^13.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@types/ws": "^8.5.10",
+    "@types/yazl": "^3.3.1",
+    "esbuild": "^0.21.5",
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5",
+    "tsx": "^4.19.0",
+    "typescript": "^6.0.0"
+  }
+}
