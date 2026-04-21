@@ -3,7 +3,7 @@ import type { SnapshotMeta } from '@salt-sync/shared';
 import type { SharedDirectoryMount } from '@salt-sync/shared';
 import type { SaltSyncSettings } from '../settings';
 import { VaultSyncEngine } from './vaultSync';
-import type { SnapshotManifest, DownloadedFile } from './vaultSync';
+import type { SnapshotManifest, DownloadedFile, SyncStatus } from './vaultSync';
 
 // ── SyncScope ─────────────────────────────────────────────────────────────────
 
@@ -161,6 +161,35 @@ export class SyncManager {
       return this.makeScope(this.primaryEngine, '主库', null);
     }
     return null;
+  }
+
+  // ── Status API ────────────────────────────────────────────────────────────
+
+  getPrimaryStatus(): SyncStatus | null {
+    return this.primaryEngine?.getStatus() ?? null;
+  }
+
+  getMountStatus(vaultId: string): SyncStatus | null {
+    const entry = this.mountEngines.find((m) => m.mount.vaultId === vaultId);
+    return entry?.engine.getStatus() ?? null;
+  }
+
+  onStatusChange(
+    handler: (key: 'primary' | string, status: SyncStatus) => void,
+  ): () => void {
+    const unsubs: Array<() => void> = [];
+
+    if (this.primaryEngine) {
+      unsubs.push(this.primaryEngine.onStatusChange((s) => handler('primary', s)));
+    }
+
+    for (const { mount, engine } of this.mountEngines) {
+      unsubs.push(engine.onStatusChange((s) => handler(mount.vaultId, s)));
+    }
+
+    return () => {
+      for (const unsub of unsubs) unsub();
+    };
   }
 
   /**

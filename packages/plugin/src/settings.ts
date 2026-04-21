@@ -1,10 +1,10 @@
 import React from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { App, PluginSettingTab, Setting, Notice } from 'obsidian';
+import { App, PluginSettingTab } from 'obsidian';
 import type SaltSyncPlugin from './main';
 import type { SharedDirectoryMount } from '@salt-sync/shared';
 import { SharedMountsSettings } from './components/SharedMountsSettings';
-import { randomUUID } from './util';
+import { PrimaryVaultSettings } from './components/PrimaryVaultSettings';
 
 export interface SaltSyncSettings {
   serverUrl: string;
@@ -45,8 +45,27 @@ export const DEFAULT_SETTINGS: SaltSyncSettings = {
   sharedMounts: [],
 };
 
+function SettingsRoot({ plugin }: { plugin: SaltSyncPlugin }) {
+  return React.createElement(
+    React.Fragment,
+    null,
+    React.createElement('h2', null, 'Salt Sync 设置'),
+    React.createElement(PrimaryVaultSettings, { plugin }),
+    React.createElement('hr', null),
+    React.createElement(SharedMountsSettings, {
+      plugin,
+      mounts: plugin.settings.sharedMounts ?? [],
+      onSave: async (mounts: SharedDirectoryMount[]) => {
+        plugin.settings.sharedMounts = mounts;
+        await plugin.saveSettings();
+        await plugin.refreshSync();
+      },
+    }),
+  );
+}
+
 export class SaltSyncSettingTab extends PluginSettingTab {
-  private mountsRoot: Root | null = null;
+  private root: Root | null = null;
 
   constructor(
     app: App,
@@ -57,111 +76,15 @@ export class SaltSyncSettingTab extends PluginSettingTab {
 
   display(): void {
     const { containerEl } = this;
+    this.root?.unmount();
+    this.root = null;
     containerEl.empty();
-    // Tear down previous React root if any
-    this.mountsRoot?.unmount();
-    this.mountsRoot = null;
-
-    containerEl.createEl('h2', { text: 'Salt Sync 设置' });
-
-    new Setting(containerEl)
-      .setName('启用主库同步')
-      .setDesc('同步当前 vault，但排除由共享目录挂载接管的子目录')
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.vaultSyncEnabled)
-          .onChange(async (value) => {
-            this.plugin.settings.vaultSyncEnabled = value;
-            await this.plugin.saveSettings();
-            await this.plugin.refreshSync();
-          }),
-      );
-
-    new Setting(containerEl)
-      .setName('服务器地址')
-      .setDesc('salt-sync 服务端的 WebSocket 地址，例如 ws://localhost:3000')
-      .addText((text) =>
-        text
-          .setPlaceholder('ws://localhost:3000')
-          .setValue(this.plugin.settings.serverUrl)
-          .onChange(async (value) => {
-            this.plugin.settings.serverUrl = value.trim();
-            await this.plugin.saveSettings();
-          }),
-      );
-
-    new Setting(containerEl)
-      .setName('主库 Vault ID')
-      .setDesc('当前 vault 的唯一标识；留空时可自动生成')
-      .addText((text) =>
-        text
-          .setPlaceholder('自动生成')
-          .setValue(this.plugin.settings.vaultId)
-          .onChange(async (value) => {
-            this.plugin.settings.vaultId = value.trim();
-            await this.plugin.saveSettings();
-          }),
-      )
-      .addButton((btn) =>
-        btn.setButtonText('生成').onClick(async () => {
-          this.plugin.settings.vaultId = randomUUID();
-          await this.plugin.saveSettings();
-          this.display();
-          new Notice('已生成新的 Vault ID');
-        }),
-      );
-
-    new Setting(containerEl)
-      .setName('主库令牌')
-      .setDesc('访问主 vault 的鉴权令牌，需与服务端配置匹配')
-      .addText((text) =>
-        text
-          .setPlaceholder('dev-token')
-          .setValue(this.plugin.settings.token)
-          .onChange(async (value) => {
-            this.plugin.settings.token = value.trim();
-            await this.plugin.saveSettings();
-          }),
-      );
-
-    new Setting(containerEl)
-      .setName('设备名称')
-      .setDesc('当前设备的显示名称，可选')
-      .addText((text) =>
-        text
-          .setPlaceholder('我的笔记本')
-          .setValue(this.plugin.settings.deviceName)
-          .onChange(async (value) => {
-            this.plugin.settings.deviceName = value.trim();
-            await this.plugin.saveSettings();
-          }),
-      );
-
-    new Setting(containerEl)
-      .setName('设备 ID')
-      .setDesc('稳定设备标识，自动生成，请勿手动修改')
-      .addText((text) =>
-        text.setValue(this.plugin.settings.deviceId).setDisabled(true),
-      );
-
-    // ── 共享目录挂载（React）────────────────────────────────────────────────
-    containerEl.createEl('hr');
-    const mountsContainer = containerEl.createDiv('salt-sync-mounts-container');
-    this.mountsRoot = createRoot(mountsContainer);
-    this.mountsRoot.render(
-      React.createElement(SharedMountsSettings, {
-        mounts: this.plugin.settings.sharedMounts ?? [],
-        onSave: async (mounts: SharedDirectoryMount[]) => {
-          this.plugin.settings.sharedMounts = mounts;
-          await this.plugin.saveSettings();
-          await this.plugin.refreshSync();
-        },
-      }),
-    );
+    this.root = createRoot(containerEl);
+    this.root.render(React.createElement(SettingsRoot, { plugin: this.plugin }));
   }
 
   hide(): void {
-    this.mountsRoot?.unmount();
-    this.mountsRoot = null;
+    this.root?.unmount();
+    this.root = null;
   }
 }

@@ -73,6 +73,10 @@ export class BlobSync {
   private readonly knownLocalPaths = new Set<string>();
   private readonly pathQueues = new Map<string, Promise<void>>();
   private readonly pendingRemoteDownloads = new Map<string, BlobRef>();
+  private pendingDownloadsHandlers: Array<() => void> = [];
+  private pendingUploadsHandlers: Array<() => void> = [];
+  private pendingRemoteDeletesHandlers: Array<() => void> = [];
+  private pendingLocalDeletionsHandlers: Array<() => void> = [];
   private readonly pendingRemoteDeletes = new Set<string>();
   private readonly pendingLocalUpserts = new Set<string>();
   private readonly pendingLocalDeletions = new Map<string, string | null>();
@@ -111,6 +115,7 @@ export class BlobSync {
   /** 本地附件新建或修改时调用（path 为 docPath） */
   async handleLocalBlobChange(path: string): Promise<void> {
     this.pendingLocalUpserts.add(path);
+    this.notifyPendingUploadsChange();
     this.persistRuntimeState();
     await this.enqueuePathOperation(path, () => this.processLocalBlobUpsert(path));
     await this.flushPersistChain();
@@ -132,6 +137,7 @@ export class BlobSync {
 
     // 无论 ref 是否在 shared model，都先登记 pending，确保启动窗口期的 delete 不丢。
     this.pendingLocalDeletions.set(path, knownHash);
+    this.notifyPendingLocalDeletionsChange();
     this.persistRuntimeState();
 
     await this.enqueuePathOperation(path, () => this.processLocalBlobDeletion(path));
@@ -152,7 +158,9 @@ export class BlobSync {
         const ref = ptbMap.get(path);
         if (ref) {
           this.pendingRemoteDeletes.delete(path);
+          this.notifyPendingRemoteDeletesChange();
           this.pendingRemoteDownloads.set(path, ref);
+          this.notifyPendingDownloadsChange();
           this.persistRuntimeState();
         }
       }
@@ -164,7 +172,9 @@ export class BlobSync {
       for (const path of changedMapKeys(txn, tombMap)) {
         if (tombMap.has(path)) {
           this.pendingRemoteDownloads.delete(path);
+          this.notifyPendingDownloadsChange();
           this.pendingRemoteDeletes.add(path);
+          this.notifyPendingRemoteDeletesChange();
           this.persistRuntimeState();
         }
       }
@@ -219,6 +229,78 @@ export class BlobSync {
     return this.gateState;
   }
 
+  get pendingDownloadCount(): number {
+    return this.pendingRemoteDownloads.size;
+  }
+
+  get pendingUploadCount(): number {
+    return this.pendingLocalUpserts.size;
+  }
+
+  get pendingRemoteDeleteCount(): number {
+    return this.pendingRemoteDeletes.size;
+  }
+
+  get pendingLocalDeletionCount(): number {
+    return this.pendingLocalDeletions.size;
+  }
+
+  onPendingDownloadsChange(handler: () => void): () => void {
+    this.pendingDownloadsHandlers.push(handler);
+    return () => {
+      const idx = this.pendingDownloadsHandlers.indexOf(handler);
+      if (idx !== -1) this.pendingDownloadsHandlers.splice(idx, 1);
+    };
+  }
+
+  onPendingUploadsChange(handler: () => void): () => void {
+    this.pendingUploadsHandlers.push(handler);
+    return () => {
+      const idx = this.pendingUploadsHandlers.indexOf(handler);
+      if (idx !== -1) this.pendingUploadsHandlers.splice(idx, 1);
+    };
+  }
+
+  onPendingRemoteDeletesChange(handler: () => void): () => void {
+    this.pendingRemoteDeletesHandlers.push(handler);
+    return () => {
+      const idx = this.pendingRemoteDeletesHandlers.indexOf(handler);
+      if (idx !== -1) this.pendingRemoteDeletesHandlers.splice(idx, 1);
+    };
+  }
+
+  onPendingLocalDeletionsChange(handler: () => void): () => void {
+    this.pendingLocalDeletionsHandlers.push(handler);
+    return () => {
+      const idx = this.pendingLocalDeletionsHandlers.indexOf(handler);
+      if (idx !== -1) this.pendingLocalDeletionsHandlers.splice(idx, 1);
+    };
+  }
+
+  private notifyPendingDownloadsChange(): void {
+    for (const handler of this.pendingDownloadsHandlers) {
+      handler();
+    }
+  }
+
+  private notifyPendingUploadsChange(): void {
+    for (const handler of this.pendingUploadsHandlers) {
+      handler();
+    }
+  }
+
+  private notifyPendingRemoteDeletesChange(): void {
+    for (const handler of this.pendingRemoteDeletesHandlers) {
+      handler();
+    }
+  }
+
+  private notifyPendingLocalDeletionsChange(): void {
+    for (const handler of this.pendingLocalDeletionsHandlers) {
+      handler();
+    }
+  }
+
   async restoreRuntimeState(): Promise<void> {
     if (!this.runtimeStateStore) return;
     if (this.runtimeStateRestored) return;
@@ -233,6 +315,7 @@ export class BlobSync {
       const ref = this.pathToBlob.get(item.docPath);
       if (ref && ref.hash === item.hash) {
         this.pendingRemoteDownloads.set(item.docPath, ref);
+        this.notifyPendingDownloadsChange();
       }
     }
 
@@ -242,6 +325,7 @@ export class BlobSync {
         this.pendingRemoteDeletes.add(docPath);
       }
     }
+    this.notifyPendingRemoteDeletesChange();
 
     for (const docPath of restored.pendingLocalUpserts) {
       if (this.pendingLocalUpserts.has(docPath)) continue;
@@ -249,6 +333,7 @@ export class BlobSync {
         this.pendingLocalUpserts.add(docPath);
       }
     }
+    this.notifyPendingUploadsChange();
 
     for (const item of restored.pendingLocalDeletions ?? []) {
       if (this.pendingLocalDeletions.has(item.docPath)) continue;
@@ -258,6 +343,7 @@ export class BlobSync {
       if (this.blobTombstones.has(item.docPath)) continue;
       this.pendingLocalDeletions.set(item.docPath, item.hash);
     }
+    this.notifyPendingLocalDeletionsChange();
 
     for (const path of restored.knownLocalPaths ?? []) {
       if (this.knownLocalPaths.has(path)) continue;
@@ -468,6 +554,7 @@ export class BlobSync {
 
     for (const docPath of [...this.pendingRemoteDeletes]) {
       this.pendingRemoteDeletes.delete(docPath);
+      this.notifyPendingRemoteDeletesChange();
       await this.enqueuePathOperation(docPath, async () => {
         if (!this.blobTombstones.has(docPath)) return;
         await this.deleteLocalFile(docPath);
@@ -476,6 +563,7 @@ export class BlobSync {
 
     for (const [docPath, ref] of [...this.pendingRemoteDownloads]) {
       this.pendingRemoteDownloads.delete(docPath);
+      this.notifyPendingDownloadsChange();
       await this.enqueuePathOperation(docPath, async () => {
         const currentRef = this.pathToBlob.get(docPath);
         if (!currentRef || currentRef.hash !== ref.hash) return;
@@ -523,7 +611,10 @@ export class BlobSync {
         mutated = true;
       }
     }, 'local-blob');
-    if (mutated) this.persistRuntimeState();
+    if (mutated) {
+      this.notifyPendingLocalDeletionsChange();
+      this.persistRuntimeState();
+    }
   }
 
   private async flushPendingLocalUpserts(): Promise<void> {
@@ -564,7 +655,10 @@ export class BlobSync {
       const { arrayBuffer, hash, contentType, size } = snapshot;
 
       const existingRef = this.pathToBlob.get(path);
-      if (existingRef?.hash === hash) return;
+      if (existingRef?.hash === hash) {
+        completed = true;
+        return;
+      }
 
       await this.uploadIfNeeded(hash, arrayBuffer, contentType);
 
@@ -591,6 +685,7 @@ export class BlobSync {
     } finally {
       if (completed) {
         this.pendingLocalUpserts.delete(path);
+        this.notifyPendingUploadsChange();
       }
       this.persistRuntimeState();
     }
@@ -599,13 +694,19 @@ export class BlobSync {
   private processLocalBlobDeletion(path: string): Promise<void> {
     // 文件又出现了 → 放弃这条 deletion，交给后续的 upsert/rescan 处理。
     if (this.vault.getAbstractFileByPath(this.toVaultPath(path))) {
-      if (this.pendingLocalDeletions.delete(path)) this.persistRuntimeState();
+      if (this.pendingLocalDeletions.delete(path)) {
+        this.notifyPendingLocalDeletionsChange();
+        this.persistRuntimeState();
+      }
       return Promise.resolve();
     }
 
     // 已有 tombstone（LWW 已生效或被并发写入）→ 幂等退出。
     if (this.blobTombstones.has(path)) {
-      if (this.pendingLocalDeletions.delete(path)) this.persistRuntimeState();
+      if (this.pendingLocalDeletions.delete(path)) {
+        this.notifyPendingLocalDeletionsChange();
+        this.persistRuntimeState();
+      }
       return Promise.resolve();
     }
 
@@ -625,6 +726,7 @@ export class BlobSync {
       });
     }, 'local-blob');
     this.pendingLocalDeletions.delete(path);
+    this.notifyPendingLocalDeletionsChange();
     this.knownLocalPaths.delete(path);
     this.persistRuntimeState();
     return Promise.resolve();

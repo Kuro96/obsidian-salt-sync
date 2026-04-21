@@ -1,9 +1,14 @@
 import React, { useState } from 'react';
 import type { SharedDirectoryMount } from '@salt-sync/shared';
+import type SaltSyncPlugin from '../main';
+import { Toggle } from './common/Toggle';
+import { useSyncStatus } from './common/useSyncStatus';
+import { SyncStatusBadge } from './common/SyncStatusBadge';
 
 interface Props {
   mounts: SharedDirectoryMount[];
   onSave: (mounts: SharedDirectoryMount[]) => void;
+  plugin?: SaltSyncPlugin;
 }
 
 interface FormState {
@@ -42,36 +47,12 @@ function MountField({
   );
 }
 
-function Toggle({
-  checked,
-  onChange,
-  ariaLabel,
-}: {
-  checked: boolean;
-  onChange: (checked: boolean) => void;
-  ariaLabel: string;
-}) {
-  return (
-    <div
-      className={`checkbox-container${checked ? ' is-enabled' : ''}`}
-      aria-label={ariaLabel}
-      aria-checked={checked}
-      role="switch"
-      tabIndex={0}
-      onClick={() => onChange(!checked)}
-      onKeyDown={(e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          onChange(!checked);
-        }
-      }}
-    >
-      <input type="checkbox" checked={checked} readOnly tabIndex={-1} style={{ display: 'none' }} />
-    </div>
-  );
+function MountStatusBadge({ plugin, vaultId }: { plugin: SaltSyncPlugin; vaultId: string }) {
+  const status = useSyncStatus(plugin, vaultId);
+  return <SyncStatusBadge status={status} />;
 }
 
-export function SharedMountsSettings({ mounts: initialMounts, onSave }: Props) {
+export function SharedMountsSettings({ mounts: initialMounts, onSave, plugin }: Props) {
   const [mounts, setMounts] = useState<SharedDirectoryMount[]>(initialMounts);
   const [adding, setAdding] = useState(false);
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
@@ -166,6 +147,9 @@ export function SharedMountsSettings({ mounts: initialMounts, onSave }: Props) {
               {mount.readOnly ? ' [只读]' : ''}
               {mount.serverUrl ? ` (${mount.serverUrl})` : ''}
             </span>
+            {plugin && mount.enabled !== false && (
+              <MountStatusBadge plugin={plugin} vaultId={mount.vaultId} />
+            )}
           </div>
           <div className="salt-sync-mount-actions">
             <Toggle

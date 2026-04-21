@@ -10,6 +10,7 @@ import type {
   FileTombstone,
   BlobRef,
   BlobTombstone,
+  ConnectionStatus,
 } from '@salt-sync/shared';
 import type { SaltSyncSettings } from '../settings';
 import { IndexedDbBlobRuntimeStateStore, IndexedDbLocalCache } from '../storage/indexedDbStore';
@@ -19,6 +20,34 @@ import { ObsidianFilesystemBridge } from './filesystemBridge';
 import { BlobSync } from './blobSync';
 import { applyDiffToYText } from './diff';
 import { randomUUID, changedMapKeys, mapChanged } from '../util';
+
+// ── Sync status types ─────────────────────────────────────────────────────────
+
+export type SyncPhase =
+  | 'disconnected'
+  | 'connecting'
+  | 'authenticating'
+  | 'syncing-blobs'
+  | 'synced'
+  | 'error';
+
+export interface SyncStatus {
+  phase: SyncPhase;
+  /** 已知 markdown 文件总数（初始同步完成后有效） */
+  markdownFileCount: number;
+  /** 已知 blob 文件总数（初始同步完成后有效） */
+  blobFileCount: number;
+  /** 所有已知 blob 的字节数之和 */
+  totalBlobBytes: number;
+  /** 待下载的远端 blob 数量 */
+  pendingBlobDownloads: number;
+  /** 待上传的本地 blob 数量 */
+  pendingBlobUploads: number;
+  /** 待本地删除的远端 blob 数量 */
+  pendingBlobRemoteDeletes: number;
+  /** 待传播到服务器的本地删除数量 */
+  pendingBlobLocalDeletions: number;
+}
 
 // ── Snapshot API response types ───────────────────────────────────────────────
 
@@ -70,6 +99,8 @@ export class VaultSyncEngine implements SyncEngine {
   private awaitingInitialSync = false;
   private initialSyncComplete = false;
   private blobMaintenancePaused = true;
+  private clientStatus: ConnectionStatus = 'idle';
+  private statusHandlers: Array<(status: SyncStatus) => void> = [];
 
   /** Effective settings for this engine (may differ from plugin settings for mounts) */
   private readonly effectiveSettings: SaltSyncSettings;
@@ -202,6 +233,61 @@ export class VaultSyncEngine implements SyncEngine {
     return ytext;
   }
 
+  // ── Status API ────────────────────────────────────────────────────────────
+
+  getStatus(): SyncStatus {
+    let phase: SyncPhase;
+    if (this.clientStatus === 'failed') {
+      phase = 'error';
+    } else if (!this.hasAuthenticated && (this.clientStatus === 'connecting' || this.clientStatus === 'reconnecting')) {
+      phase = 'connecting';
+    } else if (this.hasAuthenticated && !this.initialSyncComplete) {
+      phase = 'authenticating';
+    } else if (this.initialSyncComplete && (
+      (this.blobSync?.pendingDownloadCount ?? 0) > 0 ||
+      (this.blobSync?.pendingUploadCount ?? 0) > 0 ||
+      (this.blobSync?.pendingRemoteDeleteCount ?? 0) > 0 ||
+      (this.blobSync?.pendingLocalDeletionCount ?? 0) > 0
+    )) {
+      phase = 'syncing-blobs';
+    } else if (this.initialSyncComplete && (this.blobSync?.pendingDownloadCount ?? 0) === 0) {
+      phase = 'synced';
+    } else {
+      phase = 'disconnected';
+    }
+
+    let totalBlobBytes = 0;
+    for (const [, ref] of this.pathToBlob) {
+      totalBlobBytes += ref.size;
+    }
+
+    return {
+      phase,
+      markdownFileCount: this.pathToId.size,
+      blobFileCount: this.pathToBlob.size,
+      totalBlobBytes,
+      pendingBlobDownloads: this.blobSync?.pendingDownloadCount ?? 0,
+      pendingBlobUploads: this.blobSync?.pendingUploadCount ?? 0,
+      pendingBlobRemoteDeletes: this.blobSync?.pendingRemoteDeleteCount ?? 0,
+      pendingBlobLocalDeletions: this.blobSync?.pendingLocalDeletionCount ?? 0,
+    };
+  }
+
+  onStatusChange(handler: (status: SyncStatus) => void): () => void {
+    this.statusHandlers.push(handler);
+    return () => {
+      const idx = this.statusHandlers.indexOf(handler);
+      if (idx !== -1) this.statusHandlers.splice(idx, 1);
+    };
+  }
+
+  private notifyStatusChange(): void {
+    const status = this.getStatus();
+    for (const handler of this.statusHandlers) {
+      handler(status);
+    }
+  }
+
   // ── SyncEngine interface ──────────────────────────────────────────────────
 
   async start(): Promise<void> {
@@ -250,6 +336,10 @@ export class VaultSyncEngine implements SyncEngine {
       `${this.effectiveSettings.serverUrl}::${this.effectiveSettings.vaultId}`,
     );
     this.blobSync.enterStartupGate();
+    this.blobSync.onPendingDownloadsChange(() => this.notifyStatusChange());
+    this.blobSync.onPendingUploadsChange(() => this.notifyStatusChange());
+    this.blobSync.onPendingRemoteDeletesChange(() => this.notifyStatusChange());
+    this.blobSync.onPendingLocalDeletionsChange(() => this.notifyStatusChange());
 
     // Restore local cache
     await this.clearLegacyLocalCache();
@@ -354,6 +444,11 @@ export class VaultSyncEngine implements SyncEngine {
         this.client.send({ type: 'awareness_update', payload }).catch(console.error);
       },
     );
+
+    this.client.onStatusChange((s) => {
+      this.clientStatus = s;
+      this.notifyStatusChange();
+    });
 
     await this.client.connect({
       serverUrl: this.effectiveSettings.serverUrl,
@@ -509,6 +604,8 @@ export class VaultSyncEngine implements SyncEngine {
     this.awareness.destroy();
     await this.client.disconnect();
     await this.flushCacheSave();
+    this.notifyStatusChange();
+    this.statusHandlers = [];
   }
 
   /**
@@ -797,6 +894,7 @@ export class VaultSyncEngine implements SyncEngine {
       this.awaitingInitialSync = true;
     }
     this.hasAuthenticated = true;
+    this.notifyStatusChange();
   }
 
   private async completeInitialSync(): Promise<void> {
@@ -812,6 +910,7 @@ export class VaultSyncEngine implements SyncEngine {
     }
     this.bindAllOpenEditors();
     this.validateAllOpenBindings();
+    this.notifyStatusChange();
   }
 
   private async runBlobMaintenance(mode: 'authoritative' | 'conservative'): Promise<void> {

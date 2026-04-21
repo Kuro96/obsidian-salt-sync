@@ -3,6 +3,7 @@ import { DEFAULT_SETTINGS, SaltSyncSettingTab } from './settings';
 import type { SaltSyncSettings } from './settings';
 import { SyncManager } from './sync/syncManager';
 import type { SyncScope } from './sync/syncManager';
+import type { SyncStatus } from './sync/vaultSync';
 import { resolveDeviceId } from './storage/deviceId';
 import { SnapshotPickerModal } from './ui/snapshotPickerModal';
 import { SnapshotDetailModal } from './ui/snapshotDetailModal';
@@ -12,6 +13,15 @@ import { DiffPreviewModal } from './ui/diffPreviewModal';
 export default class SaltSyncPlugin extends Plugin {
   settings!: SaltSyncSettings;
   private manager: SyncManager | null = null;
+  /**
+   * Plugin 层的状态订阅注册表。
+   * key: 调用方传入的 handler；value: 当前 manager 返回的注销函数。
+   * 当 manager 为 null 时 value 为 no-op，下次 startSync 会替换为真实注销函数。
+   */
+  private readonly syncStatusHandlers = new Map<
+    (key: 'primary' | string, status: SyncStatus) => void,
+    () => void
+  >();
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -161,6 +171,11 @@ export default class SaltSyncPlugin extends Plugin {
       }
 
       new Notice('Salt Sync：已连接');
+
+      // 把注册表里所有已有的 handler 接到新 manager 上（manager 重建 / 订阅早于启动 两种场景）
+      for (const [handler] of this.syncStatusHandlers) {
+        this.syncStatusHandlers.set(handler, this.manager.onStatusChange(handler));
+      }
     } catch (err) {
       console.error('[salt-sync] startSync error:', err);
       this.manager = null;
@@ -219,6 +234,24 @@ export default class SaltSyncPlugin extends Plugin {
     if (this.shouldStartAnySync()) {
       await this.startSync();
     }
+  }
+
+  getSyncStatus(key: 'primary' | string): SyncStatus | null {
+    if (!this.manager) return null;
+    if (key === 'primary') return this.manager.getPrimaryStatus();
+    return this.manager.getMountStatus(key);
+  }
+
+  onSyncStatusChange(
+    handler: (key: 'primary' | string, status: SyncStatus) => void,
+  ): () => void {
+    // 立即注册到当前 manager（若存在），否则存 no-op；startSync 会补接
+    const managerUnsub = this.manager?.onStatusChange(handler) ?? (() => {});
+    this.syncStatusHandlers.set(handler, managerUnsub);
+    return () => {
+      this.syncStatusHandlers.get(handler)?.();
+      this.syncStatusHandlers.delete(handler);
+    };
   }
 
   private shouldStartAnySync(): boolean {
