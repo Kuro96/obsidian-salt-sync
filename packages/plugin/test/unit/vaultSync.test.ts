@@ -313,6 +313,7 @@ describe('VaultSyncEngine', () => {
         client: {
           connect: (input: unknown) => Promise<void>;
           onMessage: (handler: unknown) => void;
+          onStatusChange: (handler: unknown) => void;
           send: (message: unknown) => Promise<void>;
           disconnect: () => Promise<void>;
         };
@@ -346,6 +347,7 @@ describe('VaultSyncEngine', () => {
       self.client = {
         connect: async () => {},
         onMessage: () => {},
+        onStatusChange: () => {},
         send: async () => {},
         disconnect: async () => {},
       };
