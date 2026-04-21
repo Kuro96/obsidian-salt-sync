@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import 'fake-indexeddb/auto';
 import * as Y from 'yjs';
 import { VaultSyncEngine } from '../../src/sync/vaultSync';
 import type { Plugin } from 'obsidian';
@@ -296,6 +297,69 @@ describe('VaultSyncEngine', () => {
       expect(reconciles).toBe(1);
       expect(binds).toBe(1);
       expect(validates).toBe(1);
+    });
+  });
+
+  describe('local cache namespacing', () => {
+    it('does not inherit legacy vault-only cache entries after switching server', async () => {
+      const plugin = new MockPlugin();
+      const engine = new VaultSyncEngine(plugin as unknown as Plugin, baseSettings(), null);
+      const self = engine as unknown as {
+        cache: {
+          load: (key: string) => Promise<{ vaultId: string; ydocUpdate: Uint8Array; updatedAt: string } | null>;
+          save: (key: string, state: { vaultId: string; ydocUpdate: Uint8Array; updatedAt: string }) => Promise<void>;
+          clearLegacyVaultOnlyKey: (currentKey: string, legacyVaultId: string) => Promise<boolean>;
+        };
+        client: {
+          connect: (input: unknown) => Promise<void>;
+          onMessage: (handler: unknown) => void;
+          send: (message: unknown) => Promise<void>;
+          disconnect: () => Promise<void>;
+        };
+      };
+
+      const legacyDoc = new Y.Doc();
+      legacyDoc.getMap('pathToId').set('stale.md', 'file-stale');
+      legacyDoc.getMap('idToPath').set('file-stale', 'stale.md');
+      const staleText = new Y.Text();
+      staleText.insert(0, 'stale content');
+      legacyDoc.getMap('docs').set('file-stale', staleText);
+      const legacyUpdate = Y.encodeStateAsUpdate(legacyDoc);
+
+      const loadSpy = vi.fn(async (key: string) => {
+        if (key === 'primary') {
+          return {
+            vaultId: 'primary',
+            ydocUpdate: legacyUpdate,
+            updatedAt: new Date().toISOString(),
+          };
+        }
+        return null;
+      });
+      const clearLegacySpy = vi.fn(async () => true);
+
+      self.cache = {
+        clearLegacyVaultOnlyKey: clearLegacySpy,
+        load: loadSpy,
+        save: async () => {},
+      };
+      self.client = {
+        connect: async () => {},
+        onMessage: () => {},
+        send: async () => {},
+        disconnect: async () => {},
+      };
+
+      await engine.start();
+
+      const { pathToId, docs } = internals(engine);
+      expect(clearLegacySpy).toHaveBeenCalledWith('ws://localhost:8080::primary', 'primary');
+      expect(loadSpy).toHaveBeenCalledWith('ws://localhost:8080::primary');
+      expect(loadSpy).not.toHaveBeenCalledWith('primary');
+      expect(pathToId.has('stale.md')).toBe(false);
+      expect(docs.size).toBe(0);
+
+      await engine.stop();
     });
   });
 

@@ -297,10 +297,18 @@ export class EditorBindingManager {
     for (const view of views) {
       const health = this.getBindingHealth(view);
       if (!health.bound) {
-        console.warn(`[SaltSync:Binding] validate: not bound, attempting bind`, {
+        this.bind(view, deviceName);
+        const leafId = this.getLeafId(view);
+        if (this.bindings.has(leafId)) continue;
+        if (this.pendingBinds.has(leafId)) {
+          console.info(`[SaltSync:Binding] validate: binding still settling`, {
+            path: view.file?.path ?? 'unknown',
+          });
+          continue;
+        }
+        console.warn(`[SaltSync:Binding] validate: not bound, bind attempt did not attach`, {
           path: view.file?.path ?? 'unknown',
         });
-        this.bind(view, deviceName);
       } else if (!health.healthy) {
         // ySyncFacet loss or CM instance replacement means the CM state was
         // rebuilt — heal (which patches Y.Text) won't help, we need a full

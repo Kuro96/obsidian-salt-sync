@@ -133,6 +133,27 @@ describe('BlobSync reconcile', () => {
     expect(vault.getFileByPath('assets/bad.png')).toBeNull();
   });
 
+  it('adds blob path and hash context when remote blob download returns 404', async () => {
+    const vault = new MockVault();
+    const ydoc = new Y.Doc();
+    const hash = sha256hex(new Uint8Array([9, 8, 7]));
+    (ydoc.getMap('pathToBlob') as Y.Map<{ hash: string; size: number; updatedAt: string }>).set('assets/missing.png', {
+      hash,
+      size: 3,
+      updatedAt: new Date().toISOString(),
+    });
+
+    fetchMock.mockImplementation(async () => {
+      throw new Error('Request failed, status 404');
+    });
+
+    const sync = new BlobSync('ws://server.test', 'vault-a', 'token-a', vault as never, ydoc);
+    await expect(sync.reconcile('authoritative')).rejects.toThrow(
+      /blob object missing for assets\/missing\.png \(hash=.*vault=vault-a\)/,
+    );
+    expect(vault.getFileByPath('assets/missing.png')).toBeNull();
+  });
+
   it('authoritative reconcile uploads local blob when hashes conflict', async () => {
     const vault = new MockVault();
     const ydoc = new Y.Doc();

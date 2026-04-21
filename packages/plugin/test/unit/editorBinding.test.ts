@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { EditorBindingManager } from '../../src/sync/editorBinding';
 import { MarkdownView, TFile } from '../mocks/obsidian';
 import * as Y from 'yjs';
@@ -299,5 +299,27 @@ describe('EditorBindingManager', () => {
     expect(info).not.toBeNull();
     // The cmId should have changed to reflect the new CM instance
     expect(info!.cmId).toBe('cm-2');
+  });
+
+  it('validateAllOpenBindings logs settling info instead of warning when bind is deferred', () => {
+    const host = makeHost();
+    const manager = new EditorBindingManager(host);
+    const view = makeView('note.md');
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {});
+
+    manager.validateAllOpenBindings([view], 'device-a');
+
+    expect(warnSpy).not.toHaveBeenCalledWith(
+      '[SaltSync:Binding] validate: not bound, bind attempt did not attach',
+      expect.anything(),
+    );
+    expect(infoSpy).toHaveBeenCalledWith(
+      '[SaltSync:Binding] validate: binding still settling',
+      { path: 'note.md' },
+    );
+
+    warnSpy.mockRestore();
+    infoSpy.mockRestore();
   });
 });

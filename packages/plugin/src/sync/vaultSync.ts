@@ -74,6 +74,20 @@ export class VaultSyncEngine implements SyncEngine {
   /** Effective settings for this engine (may differ from plugin settings for mounts) */
   private readonly effectiveSettings: SaltSyncSettings;
 
+  private get localCacheKey(): string {
+    return `${this.effectiveSettings.serverUrl}::${this.effectiveSettings.vaultId}`;
+  }
+
+  private async clearLegacyLocalCache(): Promise<void> {
+    const cleared = await this.cache.clearLegacyVaultOnlyKey(
+      this.localCacheKey,
+      this.effectiveSettings.vaultId,
+    );
+    if (cleared) {
+      console.info(`[VaultSync] cleared legacy local cache key for ${this.effectiveSettings.vaultId}`);
+    }
+  }
+
   constructor(
     private readonly plugin: Plugin,
     settings: SaltSyncSettings,
@@ -238,7 +252,8 @@ export class VaultSyncEngine implements SyncEngine {
     this.blobSync.enterStartupGate();
 
     // Restore local cache
-    const cached = await this.cache.load(this.effectiveSettings.vaultId);
+    await this.clearLegacyLocalCache();
+    const cached = await this.cache.load(this.localCacheKey);
     if (cached) {
       Y.applyUpdate(this.ydoc, cached.ydocUpdate, 'cache');
     }
@@ -747,8 +762,8 @@ export class VaultSyncEngine implements SyncEngine {
       this.cacheTimer = null;
     }
     const update = Y.encodeStateAsUpdate(this.ydoc);
-    await this.cache.save(this.effectiveSettings.vaultId, {
-      vaultId: this.effectiveSettings.vaultId,
+    await this.cache.save(this.localCacheKey, {
+      vaultId: this.localCacheKey,
       ydocUpdate: update,
       updatedAt: new Date().toISOString(),
     });

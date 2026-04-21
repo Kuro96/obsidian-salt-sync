@@ -43,6 +43,10 @@ function guessContentType(path: string): string {
   return map[ext] ?? 'application/octet-stream';
 }
 
+function isRequestFailedStatus(error: unknown, status: number): boolean {
+  return error instanceof Error && error.message.includes(`status ${status}`);
+}
+
 // ── BlobSync ──────────────────────────────────────────────────────────────────
 
 /**
@@ -307,11 +311,22 @@ export class BlobSync {
       if (actualHash === ref.hash) return;
     }
 
-    const resp = await requestUrl({
-      url: `${this.httpBase}/vault/${this.vaultId}/blobs/${ref.hash}`,
-      method: 'GET',
-      headers: { Authorization: `Bearer ${this.token}` },
-    });
+    let resp;
+    try {
+      resp = await requestUrl({
+        url: `${this.httpBase}/vault/${this.vaultId}/blobs/${ref.hash}`,
+        method: 'GET',
+        headers: { Authorization: `Bearer ${this.token}` },
+      });
+    } catch (error) {
+      if (isRequestFailedStatus(error, 404)) {
+        throw new Error(
+          `blob object missing for ${docPath} (hash=${ref.hash}, vault=${this.vaultId}); server metadata points to a non-existent blob`,
+          { cause: error },
+        );
+      }
+      throw error;
+    }
 
     const bytes = resp.arrayBuffer;
     const actualHash = sha256hex(new Uint8Array(bytes));

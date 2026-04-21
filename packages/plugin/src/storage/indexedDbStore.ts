@@ -81,6 +81,17 @@ export class IndexedDbLocalCache implements LocalCache {
     const db = await getDb();
     await db.delete(STORE_NAME, vaultId);
   }
+
+  async clearLegacyVaultOnlyKey(currentKey: VaultId, legacyVaultId: VaultId): Promise<boolean> {
+    if (currentKey === legacyVaultId) return false;
+    const db = await getDb();
+    const raw = await db.get(STORE_NAME, legacyVaultId) as
+      | { vaultId: string; ydocUpdate: ArrayBuffer; updatedAt: string }
+      | undefined;
+    if (!raw) return false;
+    await db.delete(STORE_NAME, legacyVaultId);
+    return true;
+  }
 }
 
 export class IndexedDbBlobRuntimeStateStore {
