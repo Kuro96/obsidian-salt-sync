@@ -1,4 +1,5 @@
 import type { VaultId } from '@salt-sync/shared';
+import type { SyncTokenMode, SyncTokenStore } from './auth/syncTokenStore.js';
 
 /**
  * Phase 5 鉴权：支持 per-vault token 绑定。
@@ -13,8 +14,10 @@ import type { VaultId } from '@salt-sync/shared';
 export class Auth {
   private readonly globalToken: string;
   private readonly vaultTokens: Map<VaultId, string>;
+  private readonly syncTokenStore: SyncTokenStore | null;
 
-  constructor() {
+  constructor(syncTokenStore: SyncTokenStore | null = null) {
+    this.syncTokenStore = syncTokenStore;
     this.globalToken = process.env.SERVER_TOKEN ?? 'dev-token';
     if (this.globalToken === 'dev-token') {
       console.warn('[auth] Using default dev-token. Set SERVER_TOKEN env var in production.');
@@ -40,6 +43,9 @@ export class Auth {
    * 不携带 vault 上下文，仅用于只需"是已知客户端"即可的场景（已少用）。
    */
   validateToken(token: string): boolean {
+    if (this.syncTokenStore?.hasAny()) {
+      return this.syncTokenStore.validateRawToken(token).ok;
+    }
     if (token === this.globalToken) return true;
     for (const t of this.vaultTokens.values()) {
       if (token === t) return true;
@@ -52,11 +58,31 @@ export class Auth {
     return token === this.globalToken;
   }
 
+  getSyncTokenMode(): SyncTokenMode {
+    return this.syncTokenStore?.getMode() ?? 'env-fallback';
+  }
+
+  getConfiguredVaultTokenCount(): number {
+    return this.vaultTokens.size;
+  }
+
+  isEnvFallbackAvailable(): boolean {
+    return this.globalToken.length > 0 || this.vaultTokens.size > 0;
+  }
+
+  getDbTokenCount(): number {
+    return this.syncTokenStore?.count() ?? 0;
+  }
+
   /**
    * Per-vault token 校验（用于 WebSocket 握手）。
    * 若为该 vault 注册了专属 token 则必须精确匹配；否则回退全局 token。
    */
   validateTokenForVault(token: string, vaultId: VaultId): boolean {
+    if (this.syncTokenStore?.hasAny()) {
+      return this.syncTokenStore.validateRawToken(token).ok;
+    }
+
     const expected = this.vaultTokens.get(vaultId);
     if (expected !== undefined) return token === expected;
     return token === this.globalToken;

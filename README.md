@@ -20,6 +20,33 @@
 - 快速上手与联调：[`docs/get-started.md`](docs/get-started.md)
 - 架构背景与设计草案：`docs/`
 
+## Admin 与 Token 管理
+
+服务端内置了一个简洁的管理页面：
+
+- 入口：`/admin`
+- 管理 API：`/admin/api/*`
+- 管理鉴权：`SERVER_TOKEN`
+
+当前 admin 页面已覆盖：
+
+- 总览：服务状态、token mode、active rooms、schema、uptime
+- Rooms：活动 room 列表与单 vault 详情
+- Snapshots：列表、创建、manifest、下载、删除、恢复
+- Tokens：同步 token 的增删改查、revoke、rotate
+- Blob GC：带强确认流程的手动清理
+- Config：只读脱敏配置概览
+
+同步 token 当前支持两种模式：
+
+- `env fallback`：数据库里还没有任何 DB token 时，仍接受 `SERVER_TOKEN` / `VAULT_TOKENS`
+- `db`：一旦创建了任意 DB token，vault 同步访问只接受 DB token，env token 立即失效
+
+注意：
+
+- `/admin` 页面 HTML 和静态资源默认可公开访问，真正受保护的是 `/admin/api/*`
+- DB token 的明文值只会在创建或 rotate 成功时返回一次，之后不会再次显示
+
 ## 开发要求
 
 - Node.js `22-24`

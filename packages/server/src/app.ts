@@ -11,11 +11,14 @@ import { BlobRouter } from './blobs/blobRouter.js';
 import { SnapshotRouter } from './snapshots/snapshotRouter.js';
 import { FileRouter } from './files/fileRouter.js';
 import { AdminRouter } from './admin/adminRouter.js';
+import { AdminApiRouter } from './admin/adminApiRouter.js';
+import type { SyncTokenStore } from './auth/syncTokenStore.js';
 import type { S3BlobStore } from './blobs/s3BlobStore.js';
 import type { S3SnapshotStore } from './snapshots/s3SnapshotStore.js';
 
 export interface AppDeps {
   auth: Auth;
+  syncTokenStore: SyncTokenStore;
   store: SqliteDocumentStore;
   roomManager: RoomManager;
   blobStore: S3BlobStore | null;
@@ -44,6 +47,15 @@ export function createApp(deps: AppDeps): AppHandle {
     : null;
   const fileRouter = new FileRouter(blobStore, snapshotStore, roomManager, auth);
   const adminRouter = new AdminRouter();
+  const adminApiRouter = new AdminApiRouter({
+    auth,
+    blobStore,
+    syncTokenStore: deps.syncTokenStore,
+    snapshotStore,
+    store: deps.store,
+    roomManager,
+    startTime,
+  });
 
   const server = http.createServer(async (req, res) => {
     const rawUrl = req.url ?? '';
@@ -67,21 +79,7 @@ export function createApp(deps: AppDeps): AppHandle {
       return;
     }
 
-    if (req.method === 'GET' && url.pathname === '/admin/api/rooms') {
-      const token =
-        (req.headers['authorization'] ?? '').replace(/^Bearer\s+/i, '') ||
-        url.searchParams.get('token') ||
-        '';
-      if (!auth.validateAdminToken(token)) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'unauthorized' }));
-        return;
-      }
-      const rooms = await Promise.all(roomManager.listActive().map((r) => r.getMeta()));
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ rooms }));
-      return;
-    }
+    if (await adminApiRouter.handle(req, res, url)) return;
 
     if (blobRouter && (await blobRouter.handle(req, res, url))) return;
     if (await fileRouter.handle(req, res, url)) return;

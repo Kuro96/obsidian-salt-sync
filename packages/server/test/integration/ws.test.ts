@@ -84,6 +84,41 @@ describe('WebSocket integration', () => {
     w.close();
   });
 
+  it('disables env fallback once DB tokens exist', async () => {
+    srv = await startTestServer({
+      serverToken: 'admin',
+      vaultTokens: { v1: 't1' },
+      dbTokens: [{ name: 'db-primary' }],
+    });
+
+    const envClient = await openWs(srv.wsUrl('v1'));
+    send(envClient, { type: 'hello', token: 't1', deviceId: 'd-env', schemaVersion: SCHEMA_VERSION });
+    const envReply = await envClient.next();
+    expect(envReply.type).toBe('auth_failed');
+    envClient.close();
+  });
+
+  it('accepts a DB token in DB token mode', async () => {
+    srv = await startTestServer({
+      serverToken: 'admin',
+      vaultTokens: { v1: 't1' },
+      dbTokens: [{ name: 'db-primary' }],
+    });
+
+    const w = await openWs(srv.wsUrl('v1'));
+    send(w, {
+      type: 'hello',
+      token: srv.dbTokenValues[0],
+      deviceId: 'd-db',
+      schemaVersion: SCHEMA_VERSION,
+    });
+    const m1 = await w.next();
+    expect(m1.type).toBe('auth_ok');
+    const m2 = await w.next();
+    expect(m2.type).toBe('sync_state_vector');
+    w.close();
+  });
+
   it('successful handshake: auth_ok then sync_state_vector', async () => {
     srv = await startTestServer({ serverToken: 'good' });
     const w = await openWs(srv.wsUrl('v1'));

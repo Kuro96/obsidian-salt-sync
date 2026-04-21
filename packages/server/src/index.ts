@@ -2,6 +2,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { Auth } from './auth.js';
+import { SyncTokenStore } from './auth/syncTokenStore.js';
 import { runMigrations } from './persistence/migrations.js';
 import { SqliteDocumentStore } from './persistence/sqliteDocumentStore.js';
 import { RoomManager } from './rooms/roomManager.js';
@@ -23,7 +24,8 @@ async function main(): Promise<void> {
   db.exec('PRAGMA foreign_keys = ON');
   runMigrations(db);
 
-  const auth = new Auth();
+  const syncTokenStore = new SyncTokenStore(db);
+  const auth = new Auth(syncTokenStore);
   const store = new SqliteDocumentStore(db);
 
   const s3Config = {
@@ -53,6 +55,7 @@ async function main(): Promise<void> {
 
   const app = createApp({
     auth,
+    syncTokenStore,
     store,
     roomManager,
     blobStore,

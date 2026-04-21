@@ -109,15 +109,36 @@ curl -H 'Authorization: Bearer dev-token' http://localhost:3000/admin/api/rooms
 
 当前 `/admin` 可做的事：
 
-- 查看健康状态
-- 查看活跃 rooms
-- 查看和创建 snapshots
-- 触发 blob GC
+- 查看总览、token mode 与运行态摘要
+- 查看活跃 rooms 与单 vault 详情
+- 查看、创建、下载、删除、恢复 snapshots
+- 管理同步 token：创建、编辑、revoke、rotate
+- 触发带强确认的 blob GC
+- 查看脱敏后的只读配置摘要
 
 当前限制：
 
 - `/admin` 页面本身没有独立登录系统，受保护的是 `/admin/api/*`
-- 更偏运维观察，不支持踢人、强制恢复 snapshot 等更重操作
+- 页面本身会把 admin token 保存在浏览器 `sessionStorage`（关闭标签页后自动清除）
+
+### 6.1 同步 token 模式切换
+
+当前服务端支持两种同步 token 模式：
+
+- `env fallback`：当数据库里还没有任何 sync token 时，继续接受 `SERVER_TOKEN` / `VAULT_TOKENS`
+- `db`：当数据库里存在至少一个 sync token 时，只接受 DB token，env token 会立即失效
+
+建议迁移流程：
+
+1. 用 `SERVER_TOKEN` 登录 `/admin`
+2. 在 `Tokens` 页面创建首个 DB token
+3. 把插件配置中的 token 改成新生成的 DB token
+4. 之后再决定是否保留环境变量里的旧 token 配置
+
+注意：
+
+- DB token 的明文只会在创建或 rotate 成功时展示一次
+- 如果你丢失了明文值，只能重新 rotate 一个新 token
 
 ## 7. 构建插件
 
@@ -166,7 +187,8 @@ corepack pnpm --filter @salt-sync/plugin dev
 说明：
 
 - `Vault ID` 必须在同一逻辑 vault 的所有设备上一致
-- `Token` 必须匹配 `SERVER_TOKEN`，或匹配 `VAULT_TOKENS` 中该 vault 的 token
+- `Token` 在 `env fallback` 模式下可以匹配 `SERVER_TOKEN`，或匹配 `VAULT_TOKENS` 中该 vault 的 token
+- 一旦服务端进入 `db` token mode，插件里的 `Token` 必须改成在 `/admin` 的 `Tokens` 页面创建出来的 DB token
 - `Device ID` 会自动生成
 
 ## 10. 最小联调流程
@@ -246,7 +268,7 @@ corepack pnpm --filter @salt-sync/plugin check:bundle-safety
 
 1. 使用反向代理提供 `HTTPS/WSS`，不要直接裸露 `http://` / `ws://`
 2. 替换 `SERVER_TOKEN=dev-token` 和默认 MinIO 凭据
-3. 优先使用 `VAULT_TOKENS` 为不同 vault 分配独立 token
+3. 优先在 `/admin` 中创建 DB token，并尽快从 env token 迁移过去
 4. 限制 `/admin` 和 `/health` 的访问面
 5. 在反向代理层增加限流和请求体大小限制，尤其是 blob 上传接口
 6. 为 SQLite 数据目录和 S3/MinIO bucket 做备份

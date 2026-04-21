@@ -7,6 +7,7 @@ import {
   ListObjectsV2Command,
 } from '@aws-sdk/client-s3';
 import { Auth } from '../../src/auth';
+import { SyncTokenStore } from '../../src/auth/syncTokenStore';
 import { runMigrations } from '../../src/persistence/migrations';
 import { SqliteDocumentStore } from '../../src/persistence/sqliteDocumentStore';
 import { RoomManager } from '../../src/rooms/roomManager';
@@ -27,6 +28,7 @@ export interface TestServer {
   app: AppHandle;
   port: number;
   baseUrl: string;
+  dbTokenValues: string[];
   wsUrl: (vaultId: string) => string;
   cleanup: () => Promise<void>;
 }
@@ -34,6 +36,7 @@ export interface TestServer {
 export interface StartTestServerOpts {
   serverToken?: string;
   vaultTokens?: Record<string, string>;
+  dbTokens?: Array<{ name: string; note?: string; expiresAt?: string | null }>;
   withS3?: boolean;
 }
 
@@ -69,7 +72,15 @@ export async function startTestServer(opts: StartTestServerOpts = {}): Promise<T
   const db = new DatabaseSync(':memory:');
   runMigrations(db);
   const store = new SqliteDocumentStore(db);
-  const auth = new Auth();
+  const syncTokenStore = new SyncTokenStore(db);
+  const dbTokenValues: string[] = [];
+  if (opts.dbTokens) {
+    for (const token of opts.dbTokens) {
+      const created = syncTokenStore.create(token);
+      dbTokenValues.push(created.rawToken);
+    }
+  }
+  const auth = new Auth(syncTokenStore);
 
   let blobStore: S3BlobStore | null = null;
   let snapshotStore: S3SnapshotStore | null = null;
@@ -81,7 +92,7 @@ export async function startTestServer(opts: StartTestServerOpts = {}): Promise<T
   }
 
   const roomManager = new RoomManager(store, snapshotStore);
-  const app = createApp({ auth, store, roomManager, blobStore, snapshotStore });
+  const app = createApp({ auth, syncTokenStore, store, roomManager, blobStore, snapshotStore });
 
   await new Promise<void>((resolve) => app.server.listen(0, '127.0.0.1', () => resolve()));
   const addr = app.server.address() as AddressInfo;
@@ -93,6 +104,7 @@ export async function startTestServer(opts: StartTestServerOpts = {}): Promise<T
     app,
     port,
     baseUrl,
+    dbTokenValues,
     wsUrl,
     async cleanup() {
       await app.close();

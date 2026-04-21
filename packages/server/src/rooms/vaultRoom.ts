@@ -22,6 +22,7 @@ import type {
 } from '@salt-sync/shared';
 import type { SqliteDocumentStore } from '../persistence/sqliteDocumentStore.js';
 import type { S3SnapshotStore } from '../snapshots/s3SnapshotStore.js';
+import { docFromPayload } from '../snapshots/snapshotUtils.js';
 
 function sha256hex(data: Uint8Array): string {
   return crypto.createHash('sha256').update(data).digest('hex');
@@ -36,6 +37,7 @@ export class VaultRoom {
   private readonly awarenessOwners = new Map<string, Set<number>>();
   private loaded = false;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastActivityAt: string | null = null;
 
   /**
    * State vector of the last successfully persisted state.
@@ -57,6 +59,7 @@ export class VaultRoom {
     // Broadcast any update to all sessions except the originator,
     // then schedule a debounced save.
     this.ydoc.on('update', (update: Uint8Array, origin: unknown) => {
+      this.markActivity();
       const originId = typeof origin === 'string' ? origin : null;
       for (const [sid, session] of this.sessions) {
         if (sid !== originId) {
@@ -73,6 +76,7 @@ export class VaultRoom {
       ({ added, updated, removed }: { added: number[]; updated: number[]; removed: number[] }, origin: unknown) => {
         const changed = added.concat(updated, removed);
         if (changed.length === 0) return;
+        this.markActivity();
 
         const originSessionId = typeof origin === 'string' ? origin : null;
         if (originSessionId) {
@@ -151,6 +155,7 @@ export class VaultRoom {
     }
 
     this.loaded = true;
+    this.markActivity();
     console.log(
       `[VaultRoom:${this.vaultId}] loaded — checkpoint v${this.lastCheckpointVersion}, ${deltas.length} journal entries`,
     );
@@ -159,6 +164,7 @@ export class VaultRoom {
   async disposeIfIdle(): Promise<boolean> {
     if (this.sessions.size > 0) return false;
     await this.saveNow();
+    this.markActivity();
     console.log(`[VaultRoom:${this.vaultId}] disposed (idle)`);
     return true;
   }
@@ -168,6 +174,7 @@ export class VaultRoom {
   async attachSession(session: TransportSession): Promise<void> {
     await this.load();
     this.sessions.set(session.id, session);
+    this.markActivity();
 
     // Send current state vector so client can request missing updates
     const sv = Y.encodeStateVector(this.ydoc);
@@ -191,6 +198,7 @@ export class VaultRoom {
     session.onClose(async () => {
       this.sessions.delete(session.id);
       await this.cleanupAwareness(session.id);
+      this.markActivity();
       console.log(`[VaultRoom:${this.vaultId}] session ${session.id} disconnected (${this.sessions.size} remaining)`);
     });
 
@@ -201,13 +209,16 @@ export class VaultRoom {
 
   async detachSession(sessionId: string): Promise<void> {
     this.sessions.delete(sessionId);
+    this.markActivity();
   }
 
   async applyClientUpdate(sessionId: string, update: Uint8Array): Promise<void> {
+    this.markActivity();
     Y.applyUpdate(this.ydoc, update, sessionId);
   }
 
   async applyAwareness(sessionId: string, payload: Uint8Array): Promise<void> {
+    this.markActivity();
     applyAwarenessUpdate(this.awareness, payload, sessionId);
   }
 
@@ -217,7 +228,25 @@ export class VaultRoom {
       schemaVersion: SCHEMA_VERSION,
       connectedClientCount: this.sessions.size,
       loaded: this.loaded,
-      updatedAt: new Date().toISOString(),
+      updatedAt: this.lastActivityAt ?? undefined,
+    };
+  }
+
+  getAdminState(): {
+    markdownPathCount: number;
+    markdownDocCount: number;
+    blobPathCount: number;
+    fileTombstoneCount: number;
+    blobTombstoneCount: number;
+    loaded: boolean;
+  } {
+    return {
+      markdownPathCount: this.pathToId.size,
+      markdownDocCount: this.docs.size,
+      blobPathCount: this.pathToBlob.size,
+      fileTombstoneCount: this.fileTombstones.size,
+      blobTombstoneCount: this.blobTombstones.size,
+      loaded: this.loaded,
     };
   }
 
@@ -248,6 +277,7 @@ export class VaultRoom {
     };
 
     await this.snapshotStore.put({ vaultId: this.vaultId, snapshotId, payload, meta });
+    this.markActivity();
 
     console.log(
       `[VaultRoom:${this.vaultId}] snapshot ${snapshotId} created (triggered by ${triggeredBy ?? 'manual'})`,
@@ -259,6 +289,36 @@ export class VaultRoom {
     });
 
     return meta;
+  }
+
+  async restoreFromSnapshotPayload(payload: Uint8Array, restoredBy = 'admin'): Promise<void> {
+    await this.load();
+
+    const snapshotDoc = docFromPayload(payload);
+    const snapshotPathToId = snapshotDoc.getMap<string>('pathToId');
+    const snapshotIdToPath = snapshotDoc.getMap<string>('idToPath');
+    const snapshotDocs = snapshotDoc.getMap<Y.Text>('docs');
+    const snapshotSys = snapshotDoc.getMap<unknown>('sys');
+    const snapshotPathToBlob = snapshotDoc.getMap<BlobRef>('pathToBlob');
+    const snapshotFileTombstones = snapshotDoc.getMap<FileTombstone>('fileTombstones') as Y.Map<FileTombstone>;
+    const snapshotBlobTombstones = snapshotDoc.getMap<BlobTombstone>('blobTombstones') as Y.Map<BlobTombstone>;
+
+    // Restore is modeled as a single Y transaction that rewrites the known shared maps
+    // to the exact snapshot state so connected sessions converge via normal update flow.
+    this.ydoc.transact(() => {
+      this.replaceScalarMap(this.pathToId, snapshotPathToId);
+      this.replaceScalarMap(this.idToPath, snapshotIdToPath);
+      this.replaceTextMap(this.docs, snapshotDocs);
+      this.replaceScalarMap(this.sys as Y.Map<unknown>, snapshotSys as Y.Map<unknown>);
+      this.replaceScalarMap(this.pathToBlob, snapshotPathToBlob);
+      this.replaceScalarMap(this.fileTombstones, snapshotFileTombstones);
+      this.replaceScalarMap(this.blobTombstones, snapshotBlobTombstones);
+      this.sys.set('restoredAt', new Date().toISOString());
+      this.sys.set('restoredBy', restoredBy);
+    }, 'restore');
+
+    await this.saveNow();
+    this.markActivity();
   }
 
   // ── Persistence ───────────────────────────────────────────────────────────
@@ -288,6 +348,7 @@ export class VaultRoom {
       vaultId: this.vaultId,
       payload: delta,
     });
+    this.markActivity();
 
     this.lastSavedSv = currentSv;
 
@@ -330,7 +391,12 @@ export class VaultRoom {
     });
 
     this.lastCheckpointVersion = newVersion;
+    this.markActivity();
     console.log(`[VaultRoom:${this.vaultId}] compacted to checkpoint v${newVersion}`);
+  }
+
+  private markActivity(): void {
+    this.lastActivityAt = new Date().toISOString();
   }
 
   private trackAwarenessOwners(
@@ -366,5 +432,31 @@ export class VaultRoom {
 
     this.awarenessOwners.delete(sessionId);
     removeAwarenessStates(this.awareness, [...owned], null);
+  }
+
+  private replaceScalarMap<T>(target: Y.Map<T>, source: Y.Map<T>): void {
+    for (const key of [...target.keys()]) {
+      if (!source.has(key)) {
+        target.delete(key);
+      }
+    }
+
+    for (const [key, value] of source) {
+      target.set(key, value);
+    }
+  }
+
+  private replaceTextMap(target: Y.Map<Y.Text>, source: Y.Map<Y.Text>): void {
+    for (const key of [...target.keys()]) {
+      if (!source.has(key)) {
+        target.delete(key);
+      }
+    }
+
+    for (const [key, value] of source) {
+      const next = new Y.Text();
+      next.insert(0, value.toString());
+      target.set(key, next);
+    }
   }
 }

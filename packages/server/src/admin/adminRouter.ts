@@ -12,7 +12,13 @@ const ADMIN_HTML = `<!DOCTYPE html>
   <title>Salt Sync Admin</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; }
-    body { margin: 0; background: #fafafa; color: #1a1a2e; }
+    html, body, #root { min-height: 100%; }
+    body {
+      margin: 0;
+      background: #131319;
+      color: #e7e7ef;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
     button { cursor: pointer; font-size: 14px; }
     input { font-size: 14px; }
     table { width: 100%; }
