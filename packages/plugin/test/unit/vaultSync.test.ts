@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vitest';
 import 'fake-indexeddb/auto';
 import * as Y from 'yjs';
 import { VaultSyncEngine } from '../../src/sync/vaultSync';
@@ -152,12 +152,13 @@ describe('VaultSyncEngine', () => {
   });
 
   describe('reconcile()', () => {
-    function setupForReconcile(localFiles: string[]) {
+    function setupForReconcile(localFiles: string[], flushed?: string[]) {
       const engine = new VaultSyncEngine(fakePlugin(), baseSettings(), null);
       const self = engine as unknown as {
         bridge: {
           markDirty: (p: string) => void;
           drain: () => Promise<void>;
+          flushFile: (p: string) => Promise<void>;
         };
         plugin: {
           app: {
@@ -166,7 +167,11 @@ describe('VaultSyncEngine', () => {
         };
       };
       // Stub out bridge (not initialized without start())
-      self.bridge = { markDirty: () => {}, drain: async () => {} };
+      self.bridge = {
+        markDirty: () => {},
+        drain: async () => {},
+        flushFile: async (p) => { flushed?.push(p); },
+      };
       // Stub vault to return only localFiles
       self.plugin = {
         app: {
@@ -252,6 +257,50 @@ describe('VaultSyncEngine', () => {
 
       expect(tombstones.has('remote.md')).toBe(false);
       expect(pathToId.get('remote.md')).toBe(fid);
+    });
+
+    it('flushes Y.Doc files to disk when local directory is empty (localPath change)', async () => {
+      const flushed: string[] = [];
+      // Disk is empty — simulates a new mount localPath with no files yet
+      const engine = setupForReconcile([], flushed);
+      const { ydoc, pathToId, idToPath, docs, tombstones } = internals(engine);
+
+      // Y.Doc has content (from IDB cache or prior remote sync)
+      const fid = 'file-1';
+      const text = new Y.Text();
+      text.insert(0, 'hello');
+      ydoc.transact(() => {
+        pathToId.set('note.md', fid);
+        idToPath.set(fid, 'note.md');
+        docs.set(fid, text);
+      });
+
+      await engine.reconcile();
+
+      // File should be flushed to disk
+      expect(flushed).toContain('note.md');
+      // No tombstone should be generated
+      expect(tombstones.has('note.md')).toBe(false);
+      // pathToId entry preserved
+      expect(pathToId.get('note.md')).toBe(fid);
+    });
+
+    it('does not flush files that already have tombstones', async () => {
+      const flushed: string[] = [];
+      const engine = setupForReconcile([], flushed);
+      const { ydoc, pathToId, idToPath, docs, tombstones } = internals(engine);
+
+      const fid = 'file-1';
+      ydoc.transact(() => {
+        pathToId.set('deleted.md', fid);
+        idToPath.set(fid, 'deleted.md');
+        docs.set(fid, new Y.Text());
+        tombstones.set('deleted.md', { deletedAt: new Date().toISOString() });
+      });
+
+      await engine.reconcile();
+
+      expect(flushed).not.toContain('deleted.md');
     });
   });
 
@@ -360,6 +409,178 @@ describe('VaultSyncEngine', () => {
       expect(loadSpy).not.toHaveBeenCalledWith('primary');
       expect(pathToId.has('stale.md')).toBe(false);
       expect(docs.size).toBe(0);
+
+      await engine.stop();
+    });
+  });
+
+  describe('stop() event guard', () => {
+    function setupWithMockPlugin(mount: SharedDirectoryMount | null = null) {
+      const plugin = new MockPlugin();
+      const engine = new VaultSyncEngine(plugin as unknown as Plugin, baseSettings(), mount);
+      const self = engine as unknown as {
+        stopped: boolean;
+        client: {
+          connect: () => Promise<void>;
+          onMessage: () => void;
+          onStatusChange: () => void;
+          send: () => Promise<void>;
+          disconnect: () => Promise<void>;
+        };
+        blobSync: {
+          enterStartupGate: () => void;
+          onPendingDownloadsChange: () => void;
+          onPendingUploadsChange: () => void;
+          onPendingRemoteDeletesChange: () => void;
+          onPendingLocalDeletionsChange: () => void;
+          handleLocalBlobDeletion: Mock;
+          handleLocalBlobChange: Mock;
+        };
+        bridge: {
+          markDirty: () => void;
+          drain: () => Promise<void>;
+          flushFile: () => Promise<void>;
+          isExpectedDelete: () => boolean;
+          syncOpenFiles: () => void;
+        };
+        editorBindings: {
+          unbindAll: () => void;
+          unbindByPath: () => void;
+          bindAllOpenEditors: () => void;
+          validateAllOpenBindings: () => void;
+          updatePathsAfterRename: () => void;
+          isHealthyBinding: () => boolean;
+        };
+        awareness: { destroy: () => void; on: () => void };
+        cache: {
+          clearLegacyVaultOnlyKey: () => Promise<boolean>;
+          load: () => Promise<null>;
+          save: () => Promise<void>;
+        };
+        blobRuntimeStateStore: { load: () => Promise<null>; save: () => Promise<void>; clear: () => Promise<void> };
+        flushCacheSave: () => Promise<void>;
+        notifyStatusChange: () => void;
+        statusHandlers: unknown[];
+      };
+
+      const blobDeletion = vi.fn(async () => {});
+      const blobChange = vi.fn(async () => {});
+
+      self.client = {
+        connect: async () => {},
+        onMessage: () => {},
+        onStatusChange: () => {},
+        send: async () => {},
+        disconnect: async () => {},
+      };
+      self.blobSync = {
+        enterStartupGate: () => {},
+        onPendingDownloadsChange: () => {},
+        onPendingUploadsChange: () => {},
+        onPendingRemoteDeletesChange: () => {},
+        onPendingLocalDeletionsChange: () => {},
+        handleLocalBlobDeletion: blobDeletion,
+        handleLocalBlobChange: blobChange,
+      };
+      self.bridge = {
+        markDirty: () => {},
+        drain: async () => {},
+        flushFile: async () => {},
+        isExpectedDelete: () => false,
+        syncOpenFiles: () => {},
+      };
+      self.editorBindings = {
+        unbindAll: () => {},
+        unbindByPath: () => {},
+        bindAllOpenEditors: () => {},
+        validateAllOpenBindings: () => {},
+        updatePathsAfterRename: () => {},
+        isHealthyBinding: () => false,
+      };
+      self.awareness = { destroy: () => {}, on: () => {}, setLocalStateField: () => {} };
+      self.cache = {
+        clearLegacyVaultOnlyKey: async () => false,
+        load: async () => null,
+        save: async () => {},
+      };
+      self.blobRuntimeStateStore = { load: async () => null, save: async () => {}, clear: async () => {} };
+      self.flushCacheSave = async () => {};
+      self.notifyStatusChange = () => {};
+      self.statusHandlers = [];
+
+      return { plugin, engine, self, blobDeletion, blobChange };
+    }
+
+    it('vault rename event does not write tombstone after stop()', async () => {
+      const { plugin, engine } = setupWithMockPlugin();
+      await engine.start();
+
+      const { ydoc, pathToId, idToPath, docs, tombstones } = internals(engine);
+      const fid = 'file-1';
+      ydoc.transact(() => {
+        pathToId.set('note.md', fid);
+        idToPath.set(fid, 'note.md');
+        docs.set(fid, new Y.Text());
+      });
+
+      await engine.stop();
+
+      // Simulate user moving note.md out of the engine's localPath scope
+      plugin.app.vault.emit('rename', { path: 'Other/note.md' }, 'note.md');
+
+      expect(tombstones.has('note.md')).toBe(false);
+      expect(pathToId.has('note.md')).toBe(true);
+    });
+
+    it('vault delete event does not write tombstone after stop()', async () => {
+      const { plugin, engine } = setupWithMockPlugin();
+      await engine.start();
+
+      const { ydoc, pathToId, idToPath, docs, tombstones } = internals(engine);
+      const fid = 'file-2';
+      ydoc.transact(() => {
+        pathToId.set('doc.md', fid);
+        idToPath.set(fid, 'doc.md');
+        docs.set(fid, new Y.Text());
+      });
+
+      await engine.stop();
+
+      plugin.app.vault.emit('delete', { path: 'doc.md' });
+
+      expect(tombstones.has('doc.md')).toBe(false);
+      expect(pathToId.has('doc.md')).toBe(true);
+    });
+
+    it('vault rename event for blob does not enqueue deletion after stop()', async () => {
+      const mount: SharedDirectoryMount = { localPath: 'Shared', vaultId: 'shared1', token: 't', readOnly: false };
+      const { plugin, engine, blobDeletion } = setupWithMockPlugin(mount);
+      await engine.start();
+
+      await engine.stop();
+
+      // Simulate blob moved out of Shared/ while plugin was stopped
+      plugin.app.vault.emit('rename', { path: 'Other/image.png' }, 'Shared/image.png');
+
+      expect(blobDeletion).not.toHaveBeenCalled();
+    });
+
+    it('vault events are processed normally before stop()', async () => {
+      const { plugin, engine } = setupWithMockPlugin();
+      await engine.start();
+
+      const { ydoc, pathToId, idToPath, docs, tombstones } = internals(engine);
+      const fid = 'file-3';
+      ydoc.transact(() => {
+        pathToId.set('alive.md', fid);
+        idToPath.set(fid, 'alive.md');
+        docs.set(fid, new Y.Text());
+      });
+
+      // Engine still running — delete event should create tombstone
+      plugin.app.vault.emit('delete', { path: 'alive.md' });
+
+      expect(tombstones.has('alive.md')).toBe(true);
 
       await engine.stop();
     });

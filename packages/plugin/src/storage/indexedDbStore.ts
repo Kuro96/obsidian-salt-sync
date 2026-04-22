@@ -20,6 +20,12 @@ export interface BlobRuntimeState {
    * 避免把"本地已删除但 hashCache 空"的文件错误地重新下载。
    */
   knownLocalPaths?: string[];
+  /**
+   * 保存时的共享目录本地挂载路径（仅 mount 引擎写入；主 vault 不写，值为 undefined）。
+   * 恢复时若与当前 localPath 不符，knownLocalPaths 视为失效并跳过，
+   * 防止切换挂载路径后把新路径下的空目录误判为"用户删除了所有附件"。
+   */
+  localPath?: string;
   updatedAt: string;
 }
 

@@ -90,6 +90,11 @@ export class VaultSyncEngine implements SyncEngine {
    * 纯远端文件误判成本地删除。
    */
   private readonly knownLocalMarkdownPaths = new Set<string>();
+  /**
+   * 引擎是否已通过 stop() 停止。停止后不再处理 vault 文件事件，
+   * 防止用户在暂停同步期间移动文件时产生误删 tombstone。
+   */
+  private stopped = false;
 
   private cacheTimer: ReturnType<typeof setTimeout> | null = null;
   private healthCheckTimer: ReturnType<typeof setInterval> | null = null;
@@ -334,6 +339,7 @@ export class VaultSyncEngine implements SyncEngine {
       (vaultPath) => this.isPathForThisEngine(vaultPath),
       this.blobRuntimeStateStore,
       `${this.effectiveSettings.serverUrl}::${this.effectiveSettings.vaultId}`,
+      this.mount?.localPath,
     );
     this.blobSync.enterStartupGate();
     this.blobSync.onPendingDownloadsChange(() => this.notifyStatusChange());
@@ -502,6 +508,7 @@ export class VaultSyncEngine implements SyncEngine {
     // Vault file events
     this.plugin.registerEvent(
       vault.on('create', (file: TAbstractFile) => {
+        if (this.stopped) return;
         if (!this.isPathForThisEngine(file.path)) return;
         if (file.path.endsWith('.md')) {
           this.handleLocalFileChange(file.path).catch(console.error);
@@ -513,6 +520,7 @@ export class VaultSyncEngine implements SyncEngine {
 
     this.plugin.registerEvent(
       vault.on('modify', (file: TAbstractFile) => {
+        if (this.stopped) return;
         if (!this.isPathForThisEngine(file.path)) return;
         if (file.path.endsWith('.md')) {
           this.handleLocalFileChange(file.path).catch(console.error);
@@ -524,6 +532,7 @@ export class VaultSyncEngine implements SyncEngine {
 
     this.plugin.registerEvent(
       vault.on('delete', (file: TAbstractFile) => {
+        if (this.stopped) return;
         if (!this.isPathForThisEngine(file.path)) return;
         if (this.bridge.isExpectedDelete(file.path)) return; // 自写回声
         if (file.path.endsWith('.md')) {
@@ -536,6 +545,7 @@ export class VaultSyncEngine implements SyncEngine {
 
     this.plugin.registerEvent(
       vault.on('rename', (file: TAbstractFile, oldVaultPath: string) => {
+        if (this.stopped) return;
         const wasOurs = this.isPathForThisEngine(oldVaultPath);
         const isOurs = this.isPathForThisEngine(file.path);
 
@@ -592,6 +602,7 @@ export class VaultSyncEngine implements SyncEngine {
   }
 
   async stop(): Promise<void> {
+    this.stopped = true;
     if (this.healthCheckTimer) {
       clearInterval(this.healthCheckTimer);
       this.healthCheckTimer = null;
@@ -639,6 +650,22 @@ export class VaultSyncEngine implements SyncEngine {
       this.bridge.markDirty(file.path); // markDirty takes vaultPath, bridge converts
     }
     await this.bridge.drain();
+    // Materialize files that exist in the shared model but are absent from disk
+    // AND have never been seen locally in this session (knownLocalMarkdownPaths
+    // is empty, which happens when localPath changes to a new directory).
+    // Files that ARE in knownLocalMarkdownPaths but missing from disk are
+    // intentional deletions — those are handled by the tombstone loop below.
+    for (const docPath of [...this.pathToId.keys()]) {
+      if (localDocPaths.has(docPath)) continue;
+      if (this.fileTombstones.has(docPath)) continue;
+      if (this.knownLocalMarkdownPaths.has(docPath)) continue; // missing from disk → tombstone loop
+      // File exists in Y.Doc but was never seen locally: write it to the new path.
+      this.knownLocalMarkdownPaths.add(docPath);
+      localDocPaths.add(docPath);
+      await this.bridge.flushFile(docPath).catch((err) => {
+        console.error(`[VaultSync] reconcile flushFile error for ${docPath}:`, err);
+      });
+    }
     // Detect files present in the shared model but absent locally.
     // These were deleted while the plugin was not running (or the delete event
     // was missed). Write a tombstone so the remote copy is not written back.

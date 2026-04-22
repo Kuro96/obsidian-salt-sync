@@ -95,6 +95,8 @@ export class BlobSync {
     private readonly isPathForThisEngine: (vaultPath: string) => boolean = () => true,
     private readonly runtimeStateStore: BlobRuntimeStateStore | null = null,
     private readonly runtimeStateKey: VaultId = vaultId,
+    /** 共享目录的本地挂载路径（主 vault 为 undefined）。用于检测路径切换后跳过失效的 knownLocalPaths。 */
+    private readonly localPath?: string,
   ) {
     this.httpBase = wsUrlToHttpUrl(wsUrl);
     this.toVaultPath = toVaultPath;
@@ -345,11 +347,17 @@ export class BlobSync {
     }
     this.notifyPendingLocalDeletionsChange();
 
-    for (const path of restored.knownLocalPaths ?? []) {
-      if (this.knownLocalPaths.has(path)) continue;
-      // 已有 tombstone 说明删除已确认，无需再跟踪。
-      if (this.blobTombstones.has(path)) continue;
-      this.knownLocalPaths.add(path);
+    // 若 localPath 与上次保存时不同（挂载路径已切换），上次记录的 knownLocalPaths
+    // 是针对旧路径的，不能用于新路径的"缺失即删除"判断，直接跳过。
+    // 主 vault（两端均为 undefined）视为路径匹配，保持原有行为。
+    const localPathMatches = restored.localPath === this.localPath;
+    if (localPathMatches) {
+      for (const path of restored.knownLocalPaths ?? []) {
+        if (this.knownLocalPaths.has(path)) continue;
+        // 已有 tombstone 说明删除已确认，无需再跟踪。
+        if (this.blobTombstones.has(path)) continue;
+        this.knownLocalPaths.add(path);
+      }
     }
 
     this.persistRuntimeState();
@@ -777,6 +785,7 @@ export class BlobSync {
         hash,
       })),
       knownLocalPaths: [...this.knownLocalPaths],
+      localPath: this.localPath,
       updatedAt: new Date().toISOString(),
     };
   }

@@ -1333,3 +1333,176 @@ describe('BlobSync reconcile', () => {
     expect(snap?.knownLocalPaths ?? []).not.toContain('assets/to-tombstone.png');
   });
 });
+
+describe('BlobSync localPath guard (Bug 2: mount path change)', () => {
+  const fetchMock = vi.fn<typeof fetch>();
+
+  beforeEach(() => {
+    fetchMock.mockReset();
+    vi.stubGlobal('fetch', fetchMock);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('skips knownLocalPaths restore when localPath has changed, preventing false blob deletion', async () => {
+    const bytes = new Uint8Array([1, 2, 3]);
+    const hash = sha256hex(bytes);
+    const runtime = createRuntimeStateStore();
+
+    // Simulate saved state from previous session where localPath was 'OldDir'
+    await runtime.store.save('ws://server.test::vault-a', {
+      vaultId: 'ws://server.test::vault-a',
+      pendingRemoteDownloads: [],
+      pendingRemoteDeletes: [],
+      pendingLocalUpserts: [],
+      pendingLocalDeletions: [],
+      knownLocalPaths: ['image.png'],
+      localPath: 'OldDir',
+      updatedAt: new Date().toISOString(),
+    });
+
+    const vault = new MockVault();
+    // New directory is empty — simulates localPath changed to 'NewDir', no files there yet
+    const ydoc = new Y.Doc();
+    (ydoc.getMap('pathToBlob') as Y.Map<{ hash: string; size: number; updatedAt: string }>).set('image.png', {
+      hash,
+      size: bytes.byteLength,
+      updatedAt: new Date().toISOString(),
+    });
+
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.endsWith(`/blobs/${hash}`)) return binaryResponse(bytes);
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    // New engine with localPath = 'NewDir'
+    const sync = new BlobSync(
+      'ws://server.test',
+      'vault-a',
+      'token-a',
+      vault as never,
+      ydoc,
+      (docPath) => `NewDir/${docPath}`,
+      (vaultPath) => vaultPath.slice('NewDir/'.length),
+      (vaultPath) => vaultPath.startsWith('NewDir/'),
+      runtime.store,
+      'ws://server.test::vault-a',
+      'NewDir',
+    );
+
+    await sync.restoreRuntimeState();
+    await sync.reconcile('authoritative');
+
+    // knownLocalPaths was NOT restored (path changed) → isMissingLocalBlob = false
+    // → file should be downloaded, not tombstoned
+    const blobTombstones = ydoc.getMap('blobTombstones') as Y.Map<unknown>;
+    expect(blobTombstones.has('image.png')).toBe(false);
+
+    const file = vault.getFileByPath('NewDir/image.png');
+    expect(file).not.toBeNull();
+  });
+
+  it('restores knownLocalPaths normally when localPath is unchanged', async () => {
+    const bytes = new Uint8Array([4, 5, 6]);
+    const hash = sha256hex(bytes);
+    const runtime = createRuntimeStateStore();
+
+    // Simulate saved state from previous session with same localPath 'SharedDir'
+    await runtime.store.save('ws://server.test::vault-b', {
+      vaultId: 'ws://server.test::vault-b',
+      pendingRemoteDownloads: [],
+      pendingRemoteDeletes: [],
+      pendingLocalUpserts: [],
+      pendingLocalDeletions: [],
+      knownLocalPaths: ['photo.png'],
+      localPath: 'SharedDir',
+      updatedAt: new Date().toISOString(),
+    });
+
+    // New session: file was deleted while plugin was stopped, SharedDir still same path
+    const vault = new MockVault();
+    const ydoc = new Y.Doc();
+    (ydoc.getMap('pathToBlob') as Y.Map<{ hash: string; size: number; updatedAt: string }>).set('photo.png', {
+      hash,
+      size: bytes.byteLength,
+      updatedAt: new Date().toISOString(),
+    });
+
+    // New engine with same localPath = 'SharedDir'
+    const sync = new BlobSync(
+      'ws://server.test',
+      'vault-b',
+      'token-b',
+      vault as never,
+      ydoc,
+      (docPath) => `SharedDir/${docPath}`,
+      (vaultPath) => vaultPath.slice('SharedDir/'.length),
+      (vaultPath) => vaultPath.startsWith('SharedDir/'),
+      runtime.store,
+      'ws://server.test::vault-b',
+      'SharedDir',
+    );
+
+    await sync.restoreRuntimeState();
+    await sync.reconcile('authoritative');
+
+    // knownLocalPaths WAS restored (same path) → file not on disk → treated as deleted → tombstone
+    const blobTombstones = ydoc.getMap('blobTombstones') as Y.Map<{ hash: string }>;
+    expect(blobTombstones.get('photo.png')?.hash).toBe(hash);
+
+    // File should not be re-downloaded
+    expect(vault.getFileByPath('SharedDir/photo.png')).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('primary vault (localPath undefined) behaves as before — knownLocalPaths restored', async () => {
+    const bytes = new Uint8Array([7, 8, 9]);
+    const hash = sha256hex(bytes);
+    const runtime = createRuntimeStateStore();
+
+    // Primary vault: localPath is undefined on both sides
+    await runtime.store.save('ws://server.test::vault-c', {
+      vaultId: 'ws://server.test::vault-c',
+      pendingRemoteDownloads: [],
+      pendingRemoteDeletes: [],
+      pendingLocalUpserts: [],
+      pendingLocalDeletions: [],
+      knownLocalPaths: ['assets/note.png'],
+      // localPath intentionally omitted (primary vault)
+      updatedAt: new Date().toISOString(),
+    });
+
+    const vault = new MockVault();
+    const ydoc = new Y.Doc();
+    (ydoc.getMap('pathToBlob') as Y.Map<{ hash: string; size: number; updatedAt: string }>).set('assets/note.png', {
+      hash,
+      size: bytes.byteLength,
+      updatedAt: new Date().toISOString(),
+    });
+
+    // Primary vault BlobSync: no localPath param
+    const sync = new BlobSync(
+      'ws://server.test',
+      'vault-c',
+      'token-c',
+      vault as never,
+      ydoc,
+      undefined,
+      undefined,
+      undefined,
+      runtime.store,
+      'ws://server.test::vault-c',
+      // localPath omitted → undefined
+    );
+
+    await sync.restoreRuntimeState();
+    await sync.reconcile('authoritative');
+
+    // Primary vault: undefined === undefined → knownLocalPaths restored → file missing → tombstone
+    const blobTombstones = ydoc.getMap('blobTombstones') as Y.Map<{ hash: string }>;
+    expect(blobTombstones.get('assets/note.png')?.hash).toBe(hash);
+  });
+});
