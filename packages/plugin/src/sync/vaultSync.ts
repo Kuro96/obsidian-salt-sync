@@ -108,6 +108,7 @@ export class VaultSyncEngine implements SyncEngine {
   private initialSyncComplete = false;
   private markdownDeleteGateState: MarkdownDeleteGateState = 'startup-blocked';
   private readonly pendingRemoteMarkdownDeletes = new Set<string>();
+  private readonly startupRemoteMarkdownDeletes = new Set<string>();
   private blobMaintenancePaused = true;
   private clientStatus: ConnectionStatus = 'idle';
   private statusHandlers: Array<(status: SyncStatus) => void> = [];
@@ -907,6 +908,9 @@ export class VaultSyncEngine implements SyncEngine {
 
   private queueRemoteMarkdownDelete(docPath: string): void {
     this.pendingRemoteMarkdownDeletes.add(docPath);
+    if (this.markdownDeleteGateState === 'startup-blocked') {
+      this.startupRemoteMarkdownDeletes.add(docPath);
+    }
   }
 
   private queueExistingRemoteMarkdownTombstones(): void {
@@ -916,8 +920,11 @@ export class VaultSyncEngine implements SyncEngine {
   }
 
   private async openMarkdownDeleteGate(): Promise<void> {
+    const wasStartupBlocked = this.markdownDeleteGateState === 'startup-blocked';
     this.markdownDeleteGateState = 'open';
-    this.queueExistingRemoteMarkdownTombstones();
+    if (!wasStartupBlocked) {
+      this.queueExistingRemoteMarkdownTombstones();
+    }
     await this.flushPendingRemoteMarkdownDeletes();
   }
 
@@ -925,6 +932,11 @@ export class VaultSyncEngine implements SyncEngine {
     const pending = [...this.pendingRemoteMarkdownDeletes];
     this.pendingRemoteMarkdownDeletes.clear();
     for (const docPath of pending) {
+      if (!this.mount?.readOnly && this.startupRemoteMarkdownDeletes.has(docPath)) {
+        this.startupRemoteMarkdownDeletes.delete(docPath);
+        continue;
+      }
+      this.startupRemoteMarkdownDeletes.delete(docPath);
       await this.applyRemoteMarkdownDelete(docPath);
     }
   }
@@ -1032,6 +1044,7 @@ export class VaultSyncEngine implements SyncEngine {
     this.initialSyncComplete = true;
     this.enterMarkdownMaintenanceGate();
 
+    let maintenanceComplete = false;
     try {
       if (this.mount?.readOnly) {
         await this.reconcileReadOnly();
@@ -1041,8 +1054,11 @@ export class VaultSyncEngine implements SyncEngine {
         await this.runBlobMaintenance('authoritative');
         this.clearStartupTombstonesForPresentLocalFiles();
       }
+      maintenanceComplete = true;
     } finally {
-      await this.openMarkdownDeleteGate();
+      if (maintenanceComplete) {
+        await this.openMarkdownDeleteGate();
+      }
     }
     this.bindAllOpenEditors();
     this.validateAllOpenBindings();
@@ -1051,9 +1067,11 @@ export class VaultSyncEngine implements SyncEngine {
 
   private clearStartupTombstonesForPresentLocalFiles(): void {
     for (const docPath of [...this.fileTombstones.keys()]) {
-      if (this.pendingRemoteMarkdownDeletes.has(docPath)) continue;
+      if (this.pendingRemoteMarkdownDeletes.has(docPath) && !this.startupRemoteMarkdownDeletes.has(docPath)) continue;
       if (this.plugin.app.vault.getAbstractFileByPath(this.toVaultPath(docPath))) {
         this.fileTombstones.delete(docPath);
+        this.pendingRemoteMarkdownDeletes.delete(docPath);
+        this.startupRemoteMarkdownDeletes.delete(docPath);
       }
     }
   }

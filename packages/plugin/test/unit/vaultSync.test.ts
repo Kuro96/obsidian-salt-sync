@@ -304,7 +304,7 @@ describe('VaultSyncEngine', () => {
       expect(tombstones.has('kept.md')).toBe(true);
     });
 
-    it('opens the markdown delete gate for pending remote tombstones when startup reconcile throws', async () => {
+    it('keeps the markdown delete gate closed for pending remote tombstones when startup reconcile throws', async () => {
       const plugin = new MockPlugin();
       plugin.app.vault.seedText('kept.md', 'local content');
       const engine = new VaultSyncEngine(plugin as unknown as Plugin, baseSettings(), null);
@@ -352,9 +352,9 @@ describe('VaultSyncEngine', () => {
       failReconcile(err);
       await expect(startup).rejects.toThrow('reconcile failed');
 
-      expect(self.remoteFileDeleteSideEffectsOpen).toBe(true);
-      expect(deleteSpy).toHaveBeenCalledTimes(1);
-      expect(plugin.app.vault.getFileByPath('kept.md')).toBeNull();
+      expect(self.remoteFileDeleteSideEffectsOpen).toBe(false);
+      expect(deleteSpy).not.toHaveBeenCalled();
+      expect(plugin.app.vault.getFileByPath('kept.md')).not.toBeNull();
       expect(tombstones.has('kept.md')).toBe(true);
     });
 
@@ -771,6 +771,146 @@ describe('VaultSyncEngine', () => {
       expect(self.remoteFileDeleteSideEffectsOpen).toBe(true);
       expect(deleteSpy).toHaveBeenCalledTimes(1);
       expect(plugin.app.vault.getFileByPath('live-delete.md')).toBeNull();
+    });
+  });
+
+  describe('markdown remote tombstone startup gate', () => {
+    async function setupStartedEngine(localFiles: Record<string, string> = {}) {
+      const plugin = new MockPlugin();
+      for (const [path, content] of Object.entries(localFiles)) {
+        plugin.app.vault.seedText(path, content);
+      }
+
+      const engine = new VaultSyncEngine(plugin as unknown as Plugin, baseSettings(), null);
+      const self = engine as unknown as {
+        cache: {
+          load: () => Promise<null>;
+          save: () => Promise<void>;
+          clearLegacyVaultOnlyKey: () => Promise<boolean>;
+        };
+        client: {
+          connect: () => Promise<void>;
+          onMessage: (handler: (msg: { type: string; update?: Uint8Array }) => Promise<void>) => void;
+          onStatusChange: () => void;
+          send: () => Promise<void>;
+          disconnect: () => Promise<void>;
+        };
+        bridge: {
+          deleteFile: Mock;
+          notifyFileClosed: Mock;
+        };
+        blobSync: {
+          enterStartupGate: () => void;
+          onPendingDownloadsChange: () => void;
+          onPendingUploadsChange: () => void;
+          onPendingRemoteDeletesChange: () => void;
+          onPendingLocalDeletionsChange: () => void;
+        };
+        handleAuthOk: () => Promise<void>;
+        handleRemoteUpdate: (update: Uint8Array) => Promise<void>;
+        completeInitialSync: () => Promise<void>;
+        runBlobMaintenance: () => Promise<void>;
+      };
+      self.cache = {
+        load: async () => null,
+        save: async () => {},
+        clearLegacyVaultOnlyKey: async () => false,
+      };
+      self.client = {
+        connect: async () => {},
+        onMessage: () => {},
+        onStatusChange: () => {},
+        send: async () => {},
+        disconnect: async () => {},
+      };
+      self.runBlobMaintenance = async () => {};
+
+      await engine.start();
+
+      self.bridge.deleteFile = vi.fn(async () => {});
+      self.bridge.notifyFileClosed = vi.fn();
+      return { engine, self };
+    }
+
+    function applyRemoteTombstone(engine: VaultSyncEngine, path: string): void {
+      const { ydoc, tombstones } = internals(engine);
+      ydoc.transact(() => {
+        tombstones.set(path, {
+          deletedAt: new Date().toISOString(),
+        });
+      }, 'remote');
+    }
+
+    function applyRemoteTombstoneUpdate(engine: VaultSyncEngine, path: string): void {
+      const remoteDoc = new Y.Doc();
+      (remoteDoc.getMap('fileTombstones') as Y.Map<FileTombstone>).set(path, {
+        deletedAt: new Date().toISOString(),
+      });
+      const { ydoc } = internals(engine);
+      Y.applyUpdate(ydoc, Y.encodeStateAsUpdate(remoteDoc), 'remote');
+    }
+
+    it('does not delete for a remote startup tombstone before or after initial reconcile', async () => {
+      const { engine, self } = await setupStartedEngine({ 'local.md': 'keep me' });
+
+      await self.handleAuthOk();
+      applyRemoteTombstoneUpdate(engine, 'local.md');
+
+      expect(self.bridge.deleteFile).not.toHaveBeenCalled();
+
+      await self.completeInitialSync();
+
+      expect(self.bridge.deleteFile).not.toHaveBeenCalled();
+      await engine.stop();
+    });
+
+    it('does not delete an unclassified startup tombstone if initial reconcile fails', async () => {
+      const { engine, self } = await setupStartedEngine({ 'local.md': 'keep me' });
+
+      await self.handleAuthOk();
+      applyRemoteTombstone(engine, 'local.md');
+      vi.spyOn(engine, 'reconcile').mockRejectedValueOnce(new Error('reconcile failed'));
+
+      await expect(self.completeInitialSync()).rejects.toThrow('reconcile failed');
+
+      expect(self.bridge.deleteFile).not.toHaveBeenCalled();
+      await engine.stop();
+    });
+
+    it('does not delete for a remote tombstone received after initial reconcile fails', async () => {
+      const { engine, self } = await setupStartedEngine({ 'local.md': 'keep me' });
+
+      await self.handleAuthOk();
+      vi.spyOn(engine, 'reconcile').mockRejectedValueOnce(new Error('reconcile failed'));
+
+      await expect(self.completeInitialSync()).rejects.toThrow('reconcile failed');
+      applyRemoteTombstone(engine, 'local.md');
+
+      expect(self.bridge.deleteFile).not.toHaveBeenCalled();
+      await engine.stop();
+    });
+
+    it('deletes for a remote tombstone received after initial sync maintenance completes', async () => {
+      const { engine, self } = await setupStartedEngine({ 'live.md': 'delete me' });
+
+      await self.handleAuthOk();
+      await self.completeInitialSync();
+      applyRemoteTombstone(engine, 'live.md');
+
+      expect(self.bridge.deleteFile).toHaveBeenCalledWith('live.md');
+      await engine.stop();
+    });
+
+    it('does not blindly delete pre-existing tombstones when opening the startup path', async () => {
+      const { engine, self } = await setupStartedEngine({ 'cached.md': 'keep me' });
+      const { tombstones } = internals(engine);
+      tombstones.set('cached.md', { deletedAt: new Date().toISOString() });
+
+      await self.handleAuthOk();
+      await self.completeInitialSync();
+
+      expect(self.bridge.deleteFile).not.toHaveBeenCalled();
+      await engine.stop();
     });
   });
 
