@@ -204,6 +204,43 @@ describe('Two-engine end-to-end (text + delete)', () => {
     expect(bindings.getBindingDebugInfo('bound-delete.md')).toBeNull();
   });
 
+  it('remote markdown delete propagates to a read-only shared mount after startup', async () => {
+    srv = await startTestServer({ serverToken: ADMIN });
+    const wsBase = `ws://127.0.0.1:${srv.port}`;
+    const vaultId = makeVaultId();
+
+    const readOnlyMount = {
+      enabled: true,
+      localPath: 'Shared',
+      vaultId,
+      token: ADMIN,
+      serverUrl: wsBase,
+      readOnly: true,
+    };
+
+    const a = await startEngine({ serverUrl: wsBase, vaultId, token: ADMIN, deviceId: 'A' });
+    const b = await startEngine({
+      serverUrl: wsBase,
+      vaultId,
+      token: ADMIN,
+      deviceId: 'B',
+      mount: readOnlyMount,
+      beforeStart: ({ vault }) => {
+        vault.seedFolder('Shared');
+      },
+    });
+    engines.push(a, b);
+
+    await a.vault.create('read-only-delete.md', 'remote content');
+    await waitFor(() => b.vault.contents.get('Shared/read-only-delete.md') === 'remote content', 4000);
+
+    const fileA = a.vault.getFileByPath('read-only-delete.md')!;
+    await a.vault.delete(fileA);
+
+    await waitFor(() => !b.vault.contents.has('Shared/read-only-delete.md'), 4000);
+    expect(b.vault.files.has('Shared/read-only-delete.md')).toBe(false);
+  });
+
   it('A renames a markdown file → B applies the rename without leaving the old path behind', async () => {
     srv = await startTestServer({ serverToken: ADMIN });
     const wsBase = `ws://127.0.0.1:${srv.port}`;
