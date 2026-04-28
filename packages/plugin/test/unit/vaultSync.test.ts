@@ -139,7 +139,7 @@ describe('VaultSyncEngine', () => {
   });
 
   describe('remote markdown tombstones', () => {
-    function setupRemoteTombstone(initialSyncComplete: boolean) {
+    function setupRemoteTombstone(remoteFileDeleteSideEffectsOpen: boolean) {
       const engine = new VaultSyncEngine(fakePlugin(), baseSettings(), null);
       const vault = new MockVault();
       vault.seedText('kept.md', 'local content');
@@ -149,12 +149,14 @@ describe('VaultSyncEngine', () => {
         blobSync: { handleRemoteBlobChanges: (txn: Y.Transaction) => Promise<void> };
         editorBindings: { unbindByPath: (path: string) => void };
         initialSyncComplete: boolean;
+        remoteFileDeleteSideEffectsOpen: boolean;
         handleRemoteTransactionSideEffects: (txn: Y.Transaction) => void;
       };
       self.bridge = new ObsidianFilesystemBridge(vault as never, () => null, ydoc, 'primary');
       self.blobSync = { handleRemoteBlobChanges: vi.fn(async () => {}) };
       self.editorBindings = { unbindByPath: vi.fn() };
-      self.initialSyncComplete = initialSyncComplete;
+      self.initialSyncComplete = remoteFileDeleteSideEffectsOpen;
+      self.remoteFileDeleteSideEffectsOpen = remoteFileDeleteSideEffectsOpen;
       const deleteSpy = vi.spyOn(vault, 'delete');
 
       let remoteTxn: Y.Transaction | null = null;
@@ -168,7 +170,7 @@ describe('VaultSyncEngine', () => {
       return { self, vault, tombstones, deleteSpy, remoteTxn: remoteTxn! };
     }
 
-    it('does not delete local files for tombstones received before initial sync completes', async () => {
+    it('does not delete local files for tombstones received before remote delete side effects open', async () => {
       const { self, vault, tombstones, deleteSpy, remoteTxn } = setupRemoteTombstone(false);
 
       self.handleRemoteTransactionSideEffects(remoteTxn);
@@ -187,6 +189,64 @@ describe('VaultSyncEngine', () => {
 
       expect(deleteSpy).toHaveBeenCalledTimes(1);
       expect(vault.getFileByPath('kept.md')).toBeNull();
+    });
+
+    it('quarantines tombstones arriving after initialSyncComplete but before startup maintenance finishes', async () => {
+      const plugin = new MockPlugin();
+      plugin.app.vault.seedText('kept.md', 'local content');
+      const engine = new VaultSyncEngine(plugin as unknown as Plugin, baseSettings(), null);
+      const { ydoc, tombstones } = internals(engine);
+      const self = engine as unknown as {
+        bridge: ObsidianFilesystemBridge;
+        blobSync: { handleRemoteBlobChanges: (txn: Y.Transaction) => Promise<void> };
+        editorBindings: { unbindByPath: (path: string) => void };
+        initialSyncComplete: boolean;
+        remoteFileDeleteSideEffectsOpen: boolean;
+        reconcile: () => Promise<void>;
+        runBlobMaintenance: () => Promise<void>;
+        bindAllOpenEditors: () => void;
+        validateAllOpenBindings: () => void;
+        notifyStatusChange: () => void;
+        completeInitialSync: () => Promise<void>;
+        handleRemoteTransactionSideEffects: (txn: Y.Transaction) => void;
+      };
+      let finishReconcile!: () => void;
+      self.bridge = new ObsidianFilesystemBridge(plugin.app.vault as never, () => null, ydoc, 'primary');
+      self.blobSync = { handleRemoteBlobChanges: vi.fn(async () => {}) };
+      self.editorBindings = { unbindByPath: vi.fn() };
+      self.reconcile = () => new Promise<void>((resolve) => { finishReconcile = resolve; });
+      self.runBlobMaintenance = async () => {};
+      self.bindAllOpenEditors = () => {};
+      self.validateAllOpenBindings = () => {};
+      self.notifyStatusChange = () => {};
+      const deleteSpy = vi.spyOn(plugin.app.vault, 'delete');
+
+      const startup = self.completeInitialSync();
+      await flushPromises();
+      expect(self.initialSyncComplete).toBe(true);
+      expect(self.remoteFileDeleteSideEffectsOpen).toBe(false);
+
+      let remoteTxn: Y.Transaction | null = null;
+      ydoc.on('afterTransaction', (txn) => {
+        if (txn.origin === 'remote') remoteTxn = txn;
+      });
+      ydoc.transact(() => {
+        tombstones.set('kept.md', { deletedAt: new Date().toISOString() });
+      }, 'remote');
+
+      self.handleRemoteTransactionSideEffects(remoteTxn!);
+      await flushPromises();
+      expect(deleteSpy).not.toHaveBeenCalled();
+      expect(plugin.app.vault.getFileByPath('kept.md')).not.toBeNull();
+      expect(tombstones.has('kept.md')).toBe(true);
+
+      finishReconcile();
+      await startup;
+
+      expect(self.remoteFileDeleteSideEffectsOpen).toBe(true);
+      expect(deleteSpy).not.toHaveBeenCalled();
+      expect(plugin.app.vault.getFileByPath('kept.md')).not.toBeNull();
+      expect(tombstones.has('kept.md')).toBe(false);
     });
 
     it('clears a polluted server tombstone when the file exists during reconcile', async () => {

@@ -104,6 +104,7 @@ export class VaultSyncEngine implements SyncEngine {
   private hasAuthenticated = false;
   private awaitingInitialSync = false;
   private initialSyncComplete = false;
+  private remoteFileDeleteSideEffectsOpen = false;
   private blobMaintenancePaused = true;
   private clientStatus: ConnectionStatus = 'idle';
   private statusHandlers: Array<(status: SyncStatus) => void> = [];
@@ -877,11 +878,11 @@ export class VaultSyncEngine implements SyncEngine {
     this.bridge.handleRemoteTransaction(txn, this.docs, this.idToPath, changedDocIds);
 
     // 远端 markdown 删除 → 本地删除对应文件。
-    // 首次同步前到达的 tombstone may be legacy server pollution; keep the model state
-    // but do not convert it into a local user-file delete. Future remote tombstones
-    // after initial sync still apply normally.
+    // Startup-period tombstones may be legacy server pollution. Keep the model
+    // state, but do not convert them into local file deletes until startup
+    // reconcile/blob maintenance has finished.
     const tombMap = this.fileTombstones;
-    if (this.initialSyncComplete && mapChanged(txn, tombMap)) {
+    if (this.remoteFileDeleteSideEffectsOpen && mapChanged(txn, tombMap)) {
       for (const docPath of changedMapKeys(txn, tombMap)) {
         if (tombMap.has(docPath)) {
           this.editorBindings.unbindByPath(this.toVaultPath(docPath));
@@ -959,6 +960,7 @@ export class VaultSyncEngine implements SyncEngine {
   private async completeInitialSync(): Promise<void> {
     this.awaitingInitialSync = false;
     this.initialSyncComplete = true;
+    this.remoteFileDeleteSideEffectsOpen = false;
 
     if (this.mount?.readOnly) {
       await this.reconcileReadOnly();
@@ -966,10 +968,20 @@ export class VaultSyncEngine implements SyncEngine {
     } else {
       await this.reconcile();
       await this.runBlobMaintenance('authoritative');
+      this.clearStartupTombstonesForPresentLocalFiles();
     }
+    this.remoteFileDeleteSideEffectsOpen = true;
     this.bindAllOpenEditors();
     this.validateAllOpenBindings();
     this.notifyStatusChange();
+  }
+
+  private clearStartupTombstonesForPresentLocalFiles(): void {
+    for (const docPath of [...this.fileTombstones.keys()]) {
+      if (this.plugin.app.vault.getAbstractFileByPath(this.toVaultPath(docPath))) {
+        this.fileTombstones.delete(docPath);
+      }
+    }
   }
 
   private async runBlobMaintenance(mode: 'authoritative' | 'conservative'): Promise<void> {
