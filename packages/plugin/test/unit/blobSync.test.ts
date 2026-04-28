@@ -919,6 +919,96 @@ describe('BlobSync reconcile', () => {
     expect(runtime.snapshot()).toBeNull();
   });
 
+  it('does not restore pending local deletions saved for a different shared mount localPath', async () => {
+    const bytes = new Uint8Array([4, 2, 0]);
+    const hash = sha256hex(bytes);
+    const runtime = createRuntimeStateStore();
+    await runtime.store.save('vault-a', {
+      vaultId: 'vault-a',
+      pendingRemoteDownloads: [],
+      pendingRemoteDeletes: [],
+      pendingLocalUpserts: [],
+      pendingLocalDeletions: [{ docPath: 'assets/old-mount.png', hash: null }],
+      knownLocalPaths: [],
+      localPath: '/vault/OldShared',
+      updatedAt: new Date().toISOString(),
+    });
+
+    const vault = new MockVault();
+    const ydoc = new Y.Doc();
+    (ydoc.getMap('pathToBlob') as Y.Map<{ hash: string; size: number; updatedAt: string }>).set('assets/old-mount.png', {
+      hash,
+      size: bytes.byteLength,
+      updatedAt: new Date().toISOString(),
+    });
+
+    const sync = new BlobSync(
+      'ws://server.test',
+      'vault-a',
+      'token-a',
+      vault as never,
+      ydoc,
+      (docPath) => `NewShared/${docPath}`,
+      (vaultPath) => vaultPath.slice('NewShared/'.length),
+      (vaultPath) => vaultPath.startsWith('NewShared/'),
+      runtime.store,
+      'vault-a',
+      '/vault/NewShared',
+    );
+
+    await sync.restoreRuntimeState();
+    await sync.openRemoteApplyGate();
+
+    expect(sync.pendingLocalDeletionCount).toBe(0);
+    expect((ydoc.getMap('pathToBlob') as Y.Map<unknown>).has('assets/old-mount.png')).toBe(true);
+    expect((ydoc.getMap('blobTombstones') as Y.Map<unknown>).has('assets/old-mount.png')).toBe(false);
+  });
+
+  it('restores pending local deletions saved for the same shared mount localPath', async () => {
+    const bytes = new Uint8Array([4, 2, 1]);
+    const hash = sha256hex(bytes);
+    const runtime = createRuntimeStateStore();
+    await runtime.store.save('vault-a', {
+      vaultId: 'vault-a',
+      pendingRemoteDownloads: [],
+      pendingRemoteDeletes: [],
+      pendingLocalUpserts: [],
+      pendingLocalDeletions: [{ docPath: 'assets/same-mount.png', hash: null }],
+      knownLocalPaths: [],
+      localPath: '/vault/Shared',
+      updatedAt: new Date().toISOString(),
+    });
+
+    const vault = new MockVault();
+    const ydoc = new Y.Doc();
+    (ydoc.getMap('pathToBlob') as Y.Map<{ hash: string; size: number; updatedAt: string }>).set('assets/same-mount.png', {
+      hash,
+      size: bytes.byteLength,
+      updatedAt: new Date().toISOString(),
+    });
+
+    const sync = new BlobSync(
+      'ws://server.test',
+      'vault-a',
+      'token-a',
+      vault as never,
+      ydoc,
+      (docPath) => `Shared/${docPath}`,
+      (vaultPath) => vaultPath.slice('Shared/'.length),
+      (vaultPath) => vaultPath.startsWith('Shared/'),
+      runtime.store,
+      'vault-a',
+      '/vault/Shared',
+    );
+
+    await sync.restoreRuntimeState();
+    await sync.openRemoteApplyGate();
+
+    expect((ydoc.getMap('pathToBlob') as Y.Map<unknown>).has('assets/same-mount.png')).toBe(false);
+    expect((ydoc.getMap('blobTombstones') as Y.Map<{ hash: string }>).get('assets/same-mount.png')?.hash).toBe(hash);
+    expect(sync.pendingLocalDeletionCount).toBe(0);
+  });
+
   it('drops pending deletion if the file reappears before flush', async () => {
     const vault = new MockVault();
     const ydoc = new Y.Doc();

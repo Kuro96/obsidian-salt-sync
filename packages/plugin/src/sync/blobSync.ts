@@ -320,6 +320,9 @@ export class BlobSync {
     const restored = await this.runtimeStateStore.load(this.runtimeStateKey);
     if (!restored) return;
 
+    // 主 vault（两端均为 undefined）视为路径匹配，保持原有行为。
+    const localPathMatches = restored.localPath === this.localPath;
+
     // 合并而非替换：注册 ydoc 监听和 restoreRuntimeState 之间可能已有新的 pending 写入，
     // 这里只补还 IDB 中尚未进入内存的条目，避免覆盖启动窗口期新产生的 pending。
     for (const item of restored.pendingRemoteDownloads) {
@@ -347,20 +350,20 @@ export class BlobSync {
     }
     this.notifyPendingUploadsChange();
 
-    for (const item of restored.pendingLocalDeletions ?? []) {
-      if (this.pendingLocalDeletions.has(item.docPath)) continue;
-      // 文件又出现了说明用户撤销了删除，放弃这条 pending。
-      if (this.vault.getAbstractFileByPath(this.toVaultPath(item.docPath))) continue;
-      // 远端已经有 tombstone → 同路径 LWW 已生效，跳过。
-      if (this.blobTombstones.has(item.docPath)) continue;
-      this.pendingLocalDeletions.set(item.docPath, item.hash);
+    if (localPathMatches) {
+      for (const item of restored.pendingLocalDeletions ?? []) {
+        if (this.pendingLocalDeletions.has(item.docPath)) continue;
+        // 文件又出现了说明用户撤销了删除，放弃这条 pending。
+        if (this.vault.getAbstractFileByPath(this.toVaultPath(item.docPath))) continue;
+        // 远端已经有 tombstone → 同路径 LWW 已生效，跳过。
+        if (this.blobTombstones.has(item.docPath)) continue;
+        this.pendingLocalDeletions.set(item.docPath, item.hash);
+      }
     }
     this.notifyPendingLocalDeletionsChange();
 
     // 若 localPath 与上次保存时不同（挂载路径已切换），上次记录的 knownLocalPaths
     // 是针对旧路径的，不能用于新路径的"缺失即删除"判断，直接跳过。
-    // 主 vault（两端均为 undefined）视为路径匹配，保持原有行为。
-    const localPathMatches = restored.localPath === this.localPath;
     if (localPathMatches) {
       for (const path of restored.knownLocalPaths ?? []) {
         if (this.knownLocalPaths.has(path)) continue;

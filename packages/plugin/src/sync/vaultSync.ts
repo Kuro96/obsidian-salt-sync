@@ -94,6 +94,7 @@ export class VaultSyncEngine implements SyncEngine {
    * 纯远端文件误判成本地删除。
    */
   private readonly knownLocalMarkdownPaths = new Set<string>();
+  private readonly pendingLocalMarkdownDeletions = new Set<string>();
   /**
    * 引擎是否已通过 stop() 停止。停止后不再处理 vault 文件事件，
    * 防止用户在暂停同步期间移动文件时产生误删 tombstone。
@@ -238,6 +239,7 @@ export class VaultSyncEngine implements SyncEngine {
   }
 
   private getOrCreateYText(docPath: string): Y.Text {
+    this.pendingLocalMarkdownDeletions.delete(docPath);
     let fileId = this.pathToId.get(docPath);
     if (!fileId) {
       fileId = randomUUID();
@@ -666,11 +668,9 @@ export class VaultSyncEngine implements SyncEngine {
       this.bridge.markDirty(file.path); // markDirty takes vaultPath, bridge converts
     }
     await this.bridge.drain();
-    // Materialize files that exist in the shared model but are absent from disk
-    // AND have never been seen locally in this session (knownLocalMarkdownPaths
-    // is empty, which happens when localPath changes to a new directory).
-    // Files that ARE in knownLocalMarkdownPaths but missing from disk are
-    // intentional deletions — those are handled by the tombstone loop below.
+    this.flushPendingLocalMarkdownDeletions(localDocPaths);
+    // Materialize shared files that are absent from disk unless this session
+    // has already confirmed the same path existed locally and then disappeared.
     for (const docPath of [...this.pathToId.keys()]) {
       if (localDocPaths.has(docPath)) continue;
       if (this.fileTombstones.has(docPath)) continue;
@@ -682,9 +682,8 @@ export class VaultSyncEngine implements SyncEngine {
         console.error(`[VaultSync] reconcile flushFile error for ${docPath}:`, err);
       });
     }
-    // Detect files present in the shared model but absent locally.
-    // These were deleted while the plugin was not running (or the delete event
-    // was missed). Write a tombstone so the remote copy is not written back.
+    // Detect paths this session has confirmed locally, then later found absent.
+    // Only those in-session misses are treated as local deletions.
     for (const docPath of [...this.pathToId.keys()]) {
       if (localDocPaths.has(docPath)) continue;
       if (this.fileTombstones.has(docPath)) continue;
@@ -706,6 +705,7 @@ export class VaultSyncEngine implements SyncEngine {
     // vault.create from another tool) never get a Y.Text and drain silently
     // skips them in importFromDisk.
     const docPath = this.toDocPath(vaultPath);
+    this.pendingLocalMarkdownDeletions.delete(docPath);
     this.knownLocalMarkdownPaths.add(docPath);
     this.getOrCreateYText(docPath);
     this.bridge.markDirty(vaultPath);
@@ -741,8 +741,30 @@ export class VaultSyncEngine implements SyncEngine {
     this.editorBindings?.unbindByPath(this.toVaultPath(docPath));
     this.knownLocalMarkdownPaths.delete(docPath);
     const fileId = this.pathToId.get(docPath);
-    if (!fileId) return;
+    if (!fileId) {
+      if (this.markdownDeleteGateState !== 'open' && !this.fileTombstones.has(docPath)) {
+        this.pendingLocalMarkdownDeletions.add(docPath);
+      }
+      return;
+    }
 
+    this.writeLocalMarkdownTombstone(docPath, fileId);
+  }
+
+  private flushPendingLocalMarkdownDeletions(localDocPaths: Set<string>): void {
+    for (const docPath of [...this.pendingLocalMarkdownDeletions]) {
+      if (localDocPaths.has(docPath)) {
+        this.pendingLocalMarkdownDeletions.delete(docPath);
+        continue;
+      }
+      const fileId = this.pathToId.get(docPath);
+      if (!fileId) continue;
+      this.writeLocalMarkdownTombstone(docPath, fileId);
+    }
+  }
+
+  private writeLocalMarkdownTombstone(docPath: string, fileId: string): void {
+    this.pendingLocalMarkdownDeletions.delete(docPath);
     this.ydoc.transact(() => {
       this.pathToId.delete(docPath);
       this.idToPath.delete(fileId);
@@ -1007,6 +1029,7 @@ export class VaultSyncEngine implements SyncEngine {
 
   private handleRemoteTransactionSideEffects(txn: Y.Transaction): void {
     this.recordMarkdownTombstoneTransaction(txn);
+    this.flushPendingLocalMarkdownDeletions(new Set());
     const changedDocIds = mapChanged(txn, this.docs) ? changedMapKeys(txn, this.docs) : [];
     this.bridge.handleRemoteTransaction(txn, this.docs, this.idToPath, changedDocIds);
 
