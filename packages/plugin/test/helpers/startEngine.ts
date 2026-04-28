@@ -1,5 +1,6 @@
 import { VaultSyncEngine } from '../../src/sync/vaultSync';
 import type { SaltSyncSettings } from '../../src/settings';
+import type { SharedDirectoryMount } from '@salt-sync/shared';
 import { MockApp, MockPlugin, MockVault, MockWorkspace } from '../mocks/obsidian';
 
 export interface StartEngineContext {
@@ -24,6 +25,7 @@ export interface StartEngineOpts {
   vaultId: string;
   token: string;
   deviceId: string;
+  mount?: SharedDirectoryMount;
   beforeStart?: (context: StartEngineContext) => void | Promise<void>;
 }
 
@@ -47,12 +49,12 @@ export async function startEngine(opts: StartEngineOpts): Promise<StartedEngine>
     deviceId: opts.deviceId,
     deviceName: opts.deviceId,
     enabled: true,
-    sharedMounts: [],
+    sharedMounts: opts.mount ? [opts.mount] : [],
   };
 
   // Cast through unknown because VaultSyncEngine expects an obsidian Plugin,
   // and our mock is a structural subset that satisfies all calls made by start().
-  const engine = new VaultSyncEngine(plugin as unknown as never, settings);
+  const engine = new VaultSyncEngine(plugin as unknown as never, settings, opts.mount ?? null);
   await engine.start();
 
   return {
