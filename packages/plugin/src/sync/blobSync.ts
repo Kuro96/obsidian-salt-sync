@@ -528,6 +528,7 @@ export class BlobSync {
       const localHash = await this.getLocalBlobHash(docPath, file);
       this.knownLocalPaths.add(docPath);
       if (this.blobTombstones.has(docPath) && mode === 'authoritative') {
+        if (this.pendingRemoteDeletes.has(docPath)) continue;
         await this.handleLocalBlobChange(docPath);
         continue;
       }
@@ -692,6 +693,10 @@ export class BlobSync {
       const existingRef = this.pathToBlob.get(path);
       if (existingRef?.hash === hash) {
         if (this.blobTombstones.has(path)) {
+          if (this.pendingRemoteDeletes.has(path)) {
+            completed = true;
+            return;
+          }
           this.ydoc.transact(() => {
             this.blobTombstones.delete(path);
           }, 'local-blob');
@@ -705,6 +710,11 @@ export class BlobSync {
       // 上传期间文件可能已被删除；再次确认本地状态，避免把刚被删除的 blob 复活
       // （或把 tombstone 清掉）。Phase 9 Issue A 的第二道防线。
       if (!this.vault.getAbstractFileByPath(this.toVaultPath(path))) {
+        completed = true;
+        return;
+      }
+
+      if (this.blobTombstones.has(path) && this.pendingRemoteDeletes.has(path)) {
         completed = true;
         return;
       }

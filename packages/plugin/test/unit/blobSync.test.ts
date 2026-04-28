@@ -590,6 +590,90 @@ describe('BlobSync reconcile', () => {
     expect(vault.getFileByPath('assets/recovered.png')).not.toBeNull();
   });
 
+  it('preserves maintenance-blocked remote tombstones through authoritative reconcile and replays the delete', async () => {
+    const vault = new MockVault();
+    const ydoc = new Y.Doc();
+    const bytes = new Uint8Array([1, 3, 5]);
+    const hash = sha256hex(bytes);
+    vault.seedBinary('assets/queued-delete.png', bytes);
+    (ydoc.getMap('pathToBlob') as Y.Map<{ hash: string; size: number; updatedAt: string }>).set('assets/queued-delete.png', {
+      hash,
+      size: bytes.byteLength,
+      updatedAt: new Date().toISOString(),
+    });
+
+    const sync = new BlobSync('ws://server.test', 'vault-a', 'token-a', vault as never, ydoc);
+    await sync.openRemoteApplyGate();
+    sync.enterMaintenanceGate();
+
+    let remoteTxn: Y.Transaction | null = null;
+    ydoc.on('afterTransaction', (txn) => {
+      if (txn.origin === 'remote') remoteTxn = txn;
+    });
+    ydoc.transact(() => {
+      (ydoc.getMap('blobTombstones') as Y.Map<{ hash: string; deletedAt: string }>).set('assets/queued-delete.png', {
+        hash,
+        deletedAt: new Date().toISOString(),
+      });
+    }, 'remote');
+
+    await sync.handleRemoteBlobChanges(remoteTxn!);
+    expect(sync.pendingRemoteDeleteCount).toBe(1);
+
+    await sync.reconcile('authoritative');
+
+    expect((ydoc.getMap('blobTombstones') as Y.Map<unknown>).has('assets/queued-delete.png')).toBe(true);
+    expect(sync.pendingRemoteDeleteCount).toBe(1);
+    expect(vault.getFileByPath('assets/queued-delete.png')).not.toBeNull();
+
+    await sync.openRemoteApplyGate();
+
+    expect(sync.pendingRemoteDeleteCount).toBe(0);
+    expect(vault.getFileByPath('assets/queued-delete.png')).toBeNull();
+  });
+
+  it('does not let pending local upserts clear queued remote tombstones before replay', async () => {
+    const vault = new MockVault();
+    const ydoc = new Y.Doc();
+    const bytes = new Uint8Array([2, 4, 8]);
+    const hash = sha256hex(bytes);
+    vault.seedBinary('assets/upsert-vs-delete.png', bytes);
+    (ydoc.getMap('pathToBlob') as Y.Map<{ hash: string; size: number; updatedAt: string }>).set('assets/upsert-vs-delete.png', {
+      hash,
+      size: bytes.byteLength,
+      updatedAt: new Date().toISOString(),
+    });
+    (ydoc.getMap('blobTombstones') as Y.Map<{ hash: string; deletedAt: string }>).set('assets/upsert-vs-delete.png', {
+      hash,
+      deletedAt: new Date().toISOString(),
+    });
+    const store = {
+      load: vi.fn(async (): Promise<BlobRuntimeState> => ({
+        vaultId: 'vault-a',
+        pendingRemoteDownloads: [],
+        pendingRemoteDeletes: ['assets/upsert-vs-delete.png'],
+        pendingLocalUpserts: ['assets/upsert-vs-delete.png'],
+        pendingLocalDeletions: [],
+        knownLocalPaths: [],
+        updatedAt: new Date().toISOString(),
+      })),
+      save: vi.fn(async () => {}),
+      clear: vi.fn(async () => {}),
+    };
+
+    const sync = new BlobSync('ws://server.test', 'vault-a', 'token-a', vault as never, ydoc, undefined, undefined, undefined, store);
+    await sync.restoreRuntimeState();
+    expect(sync.pendingUploadCount).toBe(1);
+    expect(sync.pendingRemoteDeleteCount).toBe(1);
+
+    await sync.openRemoteApplyGate();
+
+    expect(sync.pendingUploadCount).toBe(0);
+    expect(sync.pendingRemoteDeleteCount).toBe(0);
+    expect((ydoc.getMap('blobTombstones') as Y.Map<unknown>).has('assets/upsert-vs-delete.png')).toBe(true);
+    expect(vault.getFileByPath('assets/upsert-vs-delete.png')).toBeNull();
+  });
+
   it('reconcile ignores Obsidian trash and Syncthing artifact blobs', async () => {
     const vault = new MockVault();
     const ydoc = new Y.Doc();
