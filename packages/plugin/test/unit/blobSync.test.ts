@@ -423,6 +423,44 @@ describe('BlobSync reconcile', () => {
     expect(new Uint8Array(await vault.readBinary(file!))).toEqual(bytes);
   });
 
+  it('remote blob delete does not delete a folder at the blob path', async () => {
+    const vault = new MockVault();
+    const ydoc = new Y.Doc();
+    vault.seedFolder('assets/folder.png');
+    let remoteTxn: Y.Transaction | null = null;
+    ydoc.on('afterTransaction', (txn) => {
+      if (txn.origin === 'remote') remoteTxn = txn;
+    });
+
+    ydoc.transact(() => {
+      (ydoc.getMap('blobTombstones') as Y.Map<{ hash: string; deletedAt: string }>).set('assets/folder.png', {
+        hash: 'hash',
+        deletedAt: new Date().toISOString(),
+      });
+    }, 'remote');
+
+    const sync = new BlobSync('ws://server.test', 'vault-a', 'token-a', vault as never, ydoc);
+    await sync.handleRemoteBlobChanges(remoteTxn!);
+    await sync.openRemoteApplyGate();
+
+    expect(vault.getAbstractFileByPath('assets/folder.png')).toBe(vault.folders.get('assets/folder.png'));
+  });
+
+  it('reconcile ignores Obsidian trash and Syncthing artifact blobs', async () => {
+    const vault = new MockVault();
+    const ydoc = new Y.Doc();
+    vault.seedBinary('.obsidian/cache.dat', new Uint8Array([1]));
+    vault.seedBinary('.trash/deleted.png', new Uint8Array([2]));
+    vault.seedBinary('notes/.stversions/old.png', new Uint8Array([3]));
+    vault.seedBinary('notes/foo.sync-conflict-20260428.png', new Uint8Array([4]));
+
+    const sync = new BlobSync('ws://server.test', 'vault-a', 'token-a', vault as never, ydoc);
+    await sync.reconcile('authoritative');
+
+    expect((ydoc.getMap('pathToBlob') as Y.Map<unknown>).size).toBe(0);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it('restores pending remote downloads after reload', async () => {
     const bytes = new Uint8Array([4, 4, 4]);
     const hash = sha256hex(bytes);

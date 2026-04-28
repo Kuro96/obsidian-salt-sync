@@ -85,6 +85,44 @@ describe('SyncManager.getAvailableScopes', () => {
   });
 });
 
+describe('SyncManager mount validation', () => {
+  it('rejects enabled duplicate mount paths', () => {
+    const settings = baseSettings({
+      vaultSyncEnabled: false,
+      sharedMounts: [
+        { enabled: true, localPath: 'Shared', vaultId: 'a', token: 'ta' },
+        { enabled: true, localPath: 'Shared/', vaultId: 'b', token: 'tb' },
+      ],
+    });
+
+    expect(() => new SyncManager(fakePlugin(), settings)).toThrow(/不能重叠/);
+  });
+
+  it('rejects enabled parent-child mount overlaps', () => {
+    const settings = baseSettings({
+      vaultSyncEnabled: false,
+      sharedMounts: [
+        { enabled: true, localPath: 'Shared', vaultId: 'a', token: 'ta' },
+        { enabled: true, localPath: 'Shared/Sub', vaultId: 'b', token: 'tb' },
+      ],
+    });
+
+    expect(() => new SyncManager(fakePlugin(), settings)).toThrow(/不能重叠/);
+  });
+
+  it('allows overlaps when one mount is disabled', () => {
+    const settings = baseSettings({
+      vaultSyncEnabled: false,
+      sharedMounts: [
+        { enabled: true, localPath: 'Shared', vaultId: 'a', token: 'ta' },
+        { enabled: false, localPath: 'Shared/Sub', vaultId: 'b', token: 'tb' },
+      ],
+    });
+
+    expect(() => new SyncManager(fakePlugin(), settings)).not.toThrow();
+  });
+});
+
 describe('SyncManager.getScopeForPath', () => {
   it('returns primary scope for paths not under any mount', () => {
     const settings = baseSettings({

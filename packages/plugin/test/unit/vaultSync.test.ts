@@ -72,6 +72,65 @@ describe('VaultSyncEngine', () => {
       expect(engine.isPathForThisEngine('other.md')).toBe(false);
       expect(engine.isPathForThisEngine('SharedOther/y.md')).toBe(false);
     });
+
+    it('ignores Obsidian trash and Syncthing artifact paths', () => {
+      const engine = new VaultSyncEngine(fakePlugin(), baseSettings(), null, ['Shared']);
+      expect(engine.isPathForThisEngine('.obsidian/app.json')).toBe(false);
+      expect(engine.isPathForThisEngine('.trash/deleted.md')).toBe(false);
+      expect(engine.isPathForThisEngine('notes/.stfolder')).toBe(false);
+      expect(engine.isPathForThisEngine('notes/.stversions/old.md')).toBe(false);
+      expect(engine.isPathForThisEngine('notes/foo.sync-conflict-20260428.md')).toBe(false);
+    });
+  });
+
+  describe('remote rename cleanup detection', () => {
+    function renameTarget(engine: VaultSyncEngine, removedPath: string, txn: Y.Transaction): string | null {
+      return (engine as unknown as {
+        getUnambiguousRemoteRenameTarget: (path: string, txn: Y.Transaction) => string | null;
+      }).getUnambiguousRemoteRenameTarget(removedPath, txn);
+    }
+
+    it('returns null for ambiguous pathToId removal without a same-transaction target', () => {
+      const engine = new VaultSyncEngine(fakePlugin(), baseSettings(), null);
+      const { ydoc, pathToId, idToPath, docs } = internals(engine);
+      let remoteTxn: Y.Transaction | null = null;
+      ydoc.transact(() => {
+        pathToId.set('old.md', 'file-1');
+        idToPath.set('file-1', 'old.md');
+        docs.set('file-1', new Y.Text());
+      });
+      ydoc.on('afterTransaction', (txn) => {
+        if (txn.origin === 'remote') remoteTxn = txn;
+      });
+
+      ydoc.transact(() => {
+        pathToId.delete('old.md');
+      }, 'remote');
+
+      expect(renameTarget(engine, 'old.md', remoteTxn!)).toBeNull();
+    });
+
+    it('returns the target only for an unambiguous same-transaction rename', () => {
+      const engine = new VaultSyncEngine(fakePlugin(), baseSettings(), null);
+      const { ydoc, pathToId, idToPath, docs } = internals(engine);
+      let remoteTxn: Y.Transaction | null = null;
+      ydoc.transact(() => {
+        pathToId.set('old.md', 'file-1');
+        idToPath.set('file-1', 'old.md');
+        docs.set('file-1', new Y.Text());
+      });
+      ydoc.on('afterTransaction', (txn) => {
+        if (txn.origin === 'remote') remoteTxn = txn;
+      });
+
+      ydoc.transact(() => {
+        pathToId.delete('old.md');
+        pathToId.set('new.md', 'file-1');
+        idToPath.set('file-1', 'new.md');
+      }, 'remote');
+
+      expect(renameTarget(engine, 'old.md', remoteTxn!)).toBe('new.md');
+    });
   });
 
   describe('handleLocalFileDeletion', () => {

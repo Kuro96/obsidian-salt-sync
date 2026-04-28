@@ -20,6 +20,7 @@ import { ObsidianFilesystemBridge } from './filesystemBridge';
 import { BlobSync } from './blobSync';
 import { applyDiffToYText } from './diff';
 import { randomUUID, changedMapKeys, mapChanged } from '../util';
+import { isPathIgnoredBySync, isSameOrChildPath, normalizeVaultPath } from './pathSafety';
 
 // ── Sync status types ─────────────────────────────────────────────────────────
 
@@ -106,6 +107,8 @@ export class VaultSyncEngine implements SyncEngine {
   private blobMaintenancePaused = true;
   private clientStatus: ConnectionStatus = 'idle';
   private statusHandlers: Array<(status: SyncStatus) => void> = [];
+  /** Remote path deletions and their previous file IDs, captured from Y.MapEvent before afterTransaction runs. */
+  private readonly remotePathRemovalFileIds = new WeakMap<Y.Transaction, Map<string, string>>();
 
   /** Effective settings for this engine (may differ from plugin settings for mounts) */
   private readonly effectiveSettings: SaltSyncSettings;
@@ -143,6 +146,18 @@ export class VaultSyncEngine implements SyncEngine {
       this.effectiveSettings = settings;
     }
     this.deviceName = this.effectiveSettings.deviceName || 'unknown';
+    this.pathToId.observe((event, txn) => {
+      if (txn.origin !== 'remote') return;
+      for (const [path, change] of event.changes.keys) {
+        if (change.action !== 'delete' || typeof change.oldValue !== 'string') continue;
+        let removed = this.remotePathRemovalFileIds.get(txn);
+        if (!removed) {
+          removed = new Map<string, string>();
+          this.remotePathRemovalFileIds.set(txn, removed);
+        }
+        removed.set(path, change.oldValue);
+      }
+    });
   }
 
   // ── Path helpers ──────────────────────────────────────────────────────────
@@ -150,35 +165,29 @@ export class VaultSyncEngine implements SyncEngine {
   /** vault 路径 → 共享模型路径（去除挂载前缀） */
   private toDocPath = (vaultPath: string): string => {
     if (!this.mount) return vaultPath;
-    const prefix = this.mount.localPath + '/';
+    const prefix = normalizeVaultPath(this.mount.localPath) + '/';
     return vaultPath.startsWith(prefix) ? vaultPath.slice(prefix.length) : vaultPath;
   };
 
   /** 共享模型路径 → vault 路径（还原挂载前缀） */
   private toVaultPath = (docPath: string): string => {
     if (!this.mount) return docPath;
-    return this.mount.localPath + '/' + docPath;
+    return normalizeVaultPath(this.mount.localPath) + '/' + docPath;
   };
-
-  /** Syncthing 产生的元数据目录和冲突文件，不应被同步 */
-  private static isSyncthingArtifact(vaultPath: string): boolean {
-    const segments = vaultPath.split('/');
-    return segments.some((s) => s === '.stfolder' || s === '.stversions' || s === '.stignore')
-      || segments.some((s) => s.includes('.sync-conflict-'));
-  }
 
   /**
    * 判断某个 vaultPath 是否归属本引擎处理：
    * - 主 vault：不在任何挂载前缀下
    * - 挂载引擎：必须在 mount.localPath/ 下
-   * - 排除 Syncthing 产生的元数据和冲突文件
+   * - 排除 Obsidian/Trash/Syncthing 内部路径和冲突文件
    */
   isPathForThisEngine(vaultPath: string): boolean {
-    if (VaultSyncEngine.isSyncthingArtifact(vaultPath)) return false;
+    if (isPathIgnoredBySync(vaultPath)) return false;
     if (this.mount) {
-      return vaultPath.startsWith(this.mount.localPath + '/');
+      const mountPath = normalizeVaultPath(this.mount.localPath);
+      return isSameOrChildPath(vaultPath, mountPath) && normalizeVaultPath(vaultPath) !== mountPath;
     }
-    return !this.excludedPrefixes.some((p) => vaultPath.startsWith(p + '/'));
+    return !this.excludedPrefixes.some((p) => isSameOrChildPath(vaultPath, p));
   }
 
   // ── Shared model accessors ────────────────────────────────────────────────
@@ -390,8 +399,8 @@ export class VaultSyncEngine implements SyncEngine {
         for (const docPath of changedMapKeys(txn, this.pathToId)) {
           const fileId = this.pathToId.get(docPath);
           if (!fileId) {
-            // 路径从 pathToId 中移除：如果没有 tombstone，说明是 rename 的源路径，清理本地文件。
-            if (!this.fileTombstones.has(docPath)) {
+            // 路径从 pathToId 中移除：只有同一事务能证明它是单目标 rename 的源路径时，才清理本地旧路径。
+            if (!this.fileTombstones.has(docPath) && this.getUnambiguousRemoteRenameTarget(docPath, txn)) {
               this.editorBindings.unbindByPath(this.toVaultPath(docPath));
               this.bridge.notifyFileClosed(this.toVaultPath(docPath));
               this.bridge.deleteFile(docPath).catch((err) => {
@@ -891,6 +900,17 @@ export class VaultSyncEngine implements SyncEngine {
       ydocUpdate: update,
       updatedAt: new Date().toISOString(),
     });
+  }
+
+  private getUnambiguousRemoteRenameTarget(removedDocPath: string, txn: Y.Transaction): string | null {
+    const removedFileId = this.remotePathRemovalFileIds.get(txn)?.get(removedDocPath);
+    if (!removedFileId) return null;
+
+    const changedPaths = changedMapKeys(txn, this.pathToId);
+    const targets = changedPaths.filter((changedPath) => {
+      return changedPath !== removedDocPath && this.pathToId.get(changedPath) === removedFileId;
+    });
+    return targets.length === 1 ? targets[0] : null;
   }
 
   private getOpenMarkdownViews(): MarkdownView[] {

@@ -6,6 +6,7 @@ import type { VaultId, BlobHash, BlobRef, BlobTombstone } from '@salt-sync/share
 import { changedMapKeys, mapChanged } from '../util';
 import { BlobHashCache } from './blobHashCache';
 import type { BlobRuntimeState } from '../storage/indexedDbStore';
+import { isPathIgnoredBySync } from './pathSafety';
 
 interface BlobRuntimeStateStore {
   load(vaultId: VaultId): Promise<BlobRuntimeState | null>;
@@ -445,14 +446,14 @@ export class BlobSync {
 
   private async deleteLocalFile(docPath: string): Promise<void> {
     const file = this.vault.getAbstractFileByPath(this.toVaultPath(docPath));
-    if (!file) return;
+    if (!file || !('stat' in file)) return;
     this.hashCache.delete(docPath);
     this.knownLocalPaths.delete(docPath);
     await this.vault.delete(file);
   }
 
   private listLocalBlobFiles(): TFile[] {
-    return this.vault.getFiles().filter((file) => this.isPathForThisEngine(file.path) && !file.path.endsWith('.md'));
+    return this.vault.getFiles().filter((file) => this.isPathForThisEngine(file.path) && !isPathIgnoredBySync(file.path) && !file.path.endsWith('.md'));
   }
 
   private async readLocalBlobSnapshot(docPath: string): Promise<{
