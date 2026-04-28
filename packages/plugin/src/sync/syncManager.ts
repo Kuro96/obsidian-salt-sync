@@ -4,6 +4,7 @@ import type { SharedDirectoryMount } from '@salt-sync/shared';
 import type { SaltSyncSettings } from '../settings';
 import { VaultSyncEngine } from './vaultSync';
 import type { SnapshotManifest, DownloadedFile, SyncStatus } from './vaultSync';
+import { isSameOrChildPath, normalizeVaultPath, validateSharedMountOverlaps } from './pathSafety';
 
 // ── SyncScope ─────────────────────────────────────────────────────────────────
 
@@ -55,7 +56,13 @@ export class SyncManager {
   private readonly mountEngines: ManagedMountEngine[];
 
   constructor(plugin: Plugin, settings: SaltSyncSettings) {
-    const enabledMounts = (settings.sharedMounts ?? []).filter((mount) => mount.enabled);
+    const enabledMounts = (settings.sharedMounts ?? [])
+      .filter((mount) => mount.enabled)
+      .map((mount) => ({ ...mount, localPath: normalizeVaultPath(mount.localPath) }));
+    const overlapValidation = validateSharedMountOverlaps(settings.sharedMounts ?? []);
+    if (!overlapValidation.ok) {
+      throw new Error(overlapValidation.message);
+    }
     const mountPrefixes = enabledMounts.map((m) => m.localPath);
 
     this.primaryEngine = settings.vaultSyncEnabled
@@ -153,7 +160,7 @@ export class SyncManager {
    */
   getScopeForPath(vaultPath: string): SyncScope | null {
     for (const { mount, engine } of this.mountEngines) {
-      if (vaultPath.startsWith(mount.localPath + '/') || vaultPath === mount.localPath) {
+      if (isSameOrChildPath(vaultPath, mount.localPath)) {
         return this.makeScope(engine, mount.localPath, mount.localPath);
       }
     }
@@ -204,7 +211,7 @@ export class SyncManager {
   ): SyncScope {
     const toDocPath = (vaultPath: string): string => {
       if (!mountPrefix) return vaultPath;
-      const prefix = mountPrefix + '/';
+      const prefix = normalizeVaultPath(mountPrefix) + '/';
       return vaultPath.startsWith(prefix) ? vaultPath.slice(prefix.length) : vaultPath;
     };
 

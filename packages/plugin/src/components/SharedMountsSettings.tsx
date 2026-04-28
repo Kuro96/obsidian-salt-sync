@@ -4,6 +4,7 @@ import type SaltSyncPlugin from '../main';
 import { Toggle } from './common/Toggle';
 import { useSyncStatus } from './common/useSyncStatus';
 import { SyncStatusBadge } from './common/SyncStatusBadge';
+import { normalizeVaultPath, validateSharedMountOverlaps } from '../sync/pathSafety';
 
 interface Props {
   mounts: SharedDirectoryMount[];
@@ -69,12 +70,18 @@ export function SharedMountsSettings({ mounts: initialMounts, onSave, plugin }: 
   };
 
   const validate = (): boolean => {
-    const normalizedPath = form.localPath.trim();
-    if (!form.localPath.trim()) { setError('本地路径不能为空'); return false; }
+    const normalizedPath = normalizeVaultPath(form.localPath);
+    if (!normalizedPath) { setError('本地路径不能为空'); return false; }
     if (!form.vaultId.trim()) { setError('Vault ID 不能为空'); return false; }
     if (!form.token.trim()) { setError('Token 不能为空'); return false; }
-    if (mounts.some((m, i) => m.localPath === normalizedPath && i !== editingIndex)) {
-      setError('该本地路径已存在挂载');
+    const candidateMounts = editingIndex === null
+      ? [...mounts, { enabled: true, localPath: normalizedPath, vaultId: form.vaultId.trim(), token: form.token.trim() }]
+      : mounts.map((mount, index) => index === editingIndex
+        ? { ...mount, enabled: mount.enabled ?? true, localPath: normalizedPath, vaultId: form.vaultId.trim(), token: form.token.trim() }
+        : mount);
+    const overlapValidation = validateSharedMountOverlaps(candidateMounts);
+    if (!overlapValidation.ok) {
+      setError(overlapValidation.message);
       return false;
     }
     setError('');
@@ -85,7 +92,7 @@ export function SharedMountsSettings({ mounts: initialMounts, onSave, plugin }: 
     if (!validate()) return;
     const mount: SharedDirectoryMount = {
       enabled: editingIndex === null ? true : mounts[editingIndex].enabled ?? true,
-      localPath: form.localPath.trim(),
+      localPath: normalizeVaultPath(form.localPath),
       vaultId: form.vaultId.trim(),
       token: form.token.trim(),
       ...(form.serverUrl.trim() ? { serverUrl: form.serverUrl.trim() } : {}),

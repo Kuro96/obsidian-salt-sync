@@ -30,6 +30,7 @@ type Handler = (...args: unknown[]) => void;
 
 export class MockVault {
   files = new Map<string, TFile>();
+  folders = new Map<string, TFolder>();
   contents = new Map<string, string | Uint8Array>();
   private handlers = new Map<string, Set<Handler>>();
 
@@ -38,7 +39,7 @@ export class MockVault {
   }
 
   getAbstractFileByPath(path: string): TAbstractFile | null {
-    return this.files.get(path) ?? null;
+    return this.files.get(path) ?? this.folders.get(path) ?? null;
   }
 
   /** Returns all .md files. Used by VaultSyncEngine.reconcile(). */
@@ -98,6 +99,8 @@ export class MockVault {
     if (file instanceof TFile) {
       this.files.delete(file.path);
       this.contents.delete(file.path);
+    } else {
+      this.folders.delete(file.path);
     }
     this.emit('delete', file);
   }
@@ -146,6 +149,12 @@ export class MockVault {
     this.files.set(path, file);
     this.contents.set(path, bytes);
     return file;
+  }
+
+  seedFolder(path: string): TFolder {
+    const folder = new TFolder(path);
+    this.folders.set(path, folder);
+    return folder;
   }
 }
 
