@@ -1102,6 +1102,7 @@ export class VaultSyncEngine implements SyncEngine {
     this.initialSyncComplete = true;
     this.enterMarkdownMaintenanceGate();
 
+    let maintenanceComplete = false;
     try {
       if (this.mount?.readOnly) {
         await this.reconcileReadOnly();
@@ -1110,11 +1111,14 @@ export class VaultSyncEngine implements SyncEngine {
         await this.reconcile();
         await this.runBlobMaintenance('authoritative');
       }
+      maintenanceComplete = true;
     } catch (err) {
       this.markPendingStartupTombstonesFailed();
       throw err;
     }
-    await this.openMarkdownDeleteGate();
+    if (maintenanceComplete) {
+      await this.openMarkdownDeleteGate();
+    }
     this.bindAllOpenEditors();
     this.validateAllOpenBindings();
     this.notifyStatusChange();
