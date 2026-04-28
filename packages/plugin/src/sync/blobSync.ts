@@ -232,6 +232,7 @@ export class BlobSync {
     // 本地删除先于远端 apply 落地，避免远端 pathToBlob 到达时把刚删除的 blob 拉回来。
     this.flushPendingLocalDeletions();
     await this.flushPendingLocalUpserts();
+    this.queueExistingRemoteTombstones();
     await this.flushPendingRemoteChanges();
     await this.flushPersistChain();
   }
@@ -597,6 +598,19 @@ export class BlobSync {
       console.error('[BlobSync] remote change error:', err);
     }
     this.persistRuntimeState();
+  }
+
+  private queueExistingRemoteTombstones(): void {
+    let changed = false;
+    for (const docPath of this.blobTombstones.keys()) {
+      if (this.pendingRemoteDeletes.has(docPath)) continue;
+      this.pendingRemoteDeletes.add(docPath);
+      changed = true;
+    }
+    if (changed) {
+      this.notifyPendingRemoteDeletesChange();
+      this.persistRuntimeState();
+    }
   }
 
   private flushPendingLocalDeletions(): void {

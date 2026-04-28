@@ -219,6 +219,74 @@ describe('BlobSync reconcile', () => {
     expect(new Uint8Array(await vault.readBinary(file!))).toEqual(bytes);
   });
 
+  it('applies startup remote tombstones after conservative startup maintenance opens the gate', async () => {
+    const vault = new MockVault();
+    const ydoc = new Y.Doc();
+    const bytes = new Uint8Array([4, 4, 4]);
+    const hash = sha256hex(bytes);
+    vault.seedBinary('assets/deleted.png', bytes);
+
+    let remoteTxn: Y.Transaction | null = null;
+    ydoc.on('afterTransaction', (txn) => {
+      if (txn.origin === 'remote') remoteTxn = txn;
+    });
+    ydoc.transact(() => {
+      (ydoc.getMap('blobTombstones') as Y.Map<{ hash: string; deletedAt: string }>).set('assets/deleted.png', {
+        hash,
+        deletedAt: new Date().toISOString(),
+      });
+    }, 'remote');
+
+    const sync = new BlobSync('ws://server.test', 'vault-a', 'token-a', vault as never, ydoc);
+    await sync.handleRemoteBlobChanges(remoteTxn!);
+    expect(sync.getRemoteApplyGateState()).toBe('startup-blocked');
+    expect(sync.pendingRemoteDeleteCount).toBe(0);
+    expect(vault.getFileByPath('assets/deleted.png')).not.toBeNull();
+
+    await sync.reconcile('conservative');
+    expect(vault.getFileByPath('assets/deleted.png')).not.toBeNull();
+
+    await sync.openRemoteApplyGate();
+    expect(vault.getFileByPath('assets/deleted.png')).toBeNull();
+  });
+
+  it('does not delete authoritative recovered blobs after startup tombstones are cleared', async () => {
+    const vault = new MockVault();
+    const ydoc = new Y.Doc();
+    const bytes = new Uint8Array([5, 5, 5]);
+    const hash = sha256hex(bytes);
+    vault.seedBinary('assets/recovered.png', bytes);
+
+    let remoteTxn: Y.Transaction | null = null;
+    ydoc.on('afterTransaction', (txn) => {
+      if (txn.origin === 'remote') remoteTxn = txn;
+    });
+    ydoc.transact(() => {
+      (ydoc.getMap('pathToBlob') as Y.Map<{ hash: string; size: number; updatedAt: string }>).set('assets/recovered.png', {
+        hash,
+        size: bytes.byteLength,
+        updatedAt: new Date().toISOString(),
+      });
+      (ydoc.getMap('blobTombstones') as Y.Map<{ hash: string; deletedAt: string }>).set('assets/recovered.png', {
+        hash,
+        deletedAt: new Date().toISOString(),
+      });
+    }, 'remote');
+
+    const sync = new BlobSync('ws://server.test', 'vault-a', 'token-a', vault as never, ydoc);
+    await sync.handleRemoteBlobChanges(remoteTxn!);
+    expect(sync.pendingRemoteDeleteCount).toBe(0);
+
+    await sync.reconcile('authoritative');
+    expect((ydoc.getMap('blobTombstones') as Y.Map<unknown>).has('assets/recovered.png')).toBe(false);
+
+    await sync.openRemoteApplyGate();
+    const file = vault.getFileByPath('assets/recovered.png');
+    expect(file).not.toBeNull();
+    expect(new Uint8Array(await vault.readBinary(file!))).toEqual(bytes);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it('skips stale pending remote downloads after local reconcile updates the blob ref', async () => {
     const vault = new MockVault();
     const ydoc = new Y.Doc();
@@ -446,7 +514,7 @@ describe('BlobSync reconcile', () => {
     expect(vault.getAbstractFileByPath('assets/folder.png')).toBe(vault.folders.get('assets/folder.png'));
   });
 
-  it('does not delete local files for blob tombstones received before the startup gate opens', async () => {
+  it('quarantines blob tombstones received before the startup gate opens', async () => {
     const vault = new MockVault();
     const ydoc = new Y.Doc();
     vault.seedBinary('assets/kept.png', new Uint8Array([1, 2, 3]));
@@ -465,7 +533,6 @@ describe('BlobSync reconcile', () => {
     }, 'remote');
 
     await sync.handleRemoteBlobChanges(remoteTxn!);
-    await sync.openRemoteApplyGate();
 
     expect(deleteSpy).not.toHaveBeenCalled();
     expect(vault.getFileByPath('assets/kept.png')).not.toBeNull();
