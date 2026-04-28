@@ -34,7 +34,9 @@ export class ObsidianFilesystemBridge implements FilesystemBridge {
   private readonly dirtySet = new Set<string>(); // keyed by docPath
   private drainTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly writeQueues = new Map<string, Promise<void>>(); // keyed by docPath
+  private readonly writeGenerations = new Map<string, number>(); // keyed by docPath
   private readonly openWriteTimers = new Map<string, ReturnType<typeof setTimeout>>(); // keyed by docPath
+  private readonly remoteFlushQuarantine = new Set<string>(); // keyed by docPath
   private readonly expectedWrites = new Map<string, FileFingerprint>(); // keyed by docPath
   /** 预期由我们发起的自写删除（docPath 集合），避免 vault.on('delete') 回声 */
   private readonly expectedDeletes = new Set<string>();
@@ -90,8 +92,36 @@ export class ObsidianFilesystemBridge implements FilesystemBridge {
 
   /** 共享状态 -> 磁盘：串行写回指定 docPath */
   async flushFile(docPath: string): Promise<void> {
+    return this.enqueueFlushFile(docPath, this.currentWriteGeneration(docPath));
+  }
+
+  quarantineRemoteFlushes(docPaths: Iterable<string>): void {
+    for (const docPath of docPaths) {
+      this.remoteFlushQuarantine.add(docPath);
+      this.invalidateQueuedWrites(docPath);
+    }
+  }
+
+  /**
+   * Re-enable future remote flushes for these paths. Updates observed while a path was
+   * quarantined are intentionally dropped rather than deferred; startup recovery code
+   * must explicitly call forceImportFromDisk() before release when local disk content
+   * should win over a stale remote snapshot.
+   */
+  releaseRemoteFlushQuarantine(docPaths: Iterable<string>): void {
+    for (const docPath of docPaths) {
+      this.remoteFlushQuarantine.delete(docPath);
+    }
+  }
+
+  async forceImportFromDisk(docPath: string): Promise<void> {
+    this.invalidateQueuedWrites(docPath);
+    this.cancelOpenWriteTimer(docPath);
+    this.dirtySet.delete(docPath);
+    this.deferredImports.delete(docPath);
+
     const prev = this.writeQueues.get(docPath) ?? Promise.resolve();
-    const current = prev.then(() => this.doFlushFile(docPath));
+    const current = prev.then(() => this.importFromDisk(docPath, { force: true }));
     this.writeQueues.set(docPath, current.catch(() => {}));
     return current;
   }
@@ -160,6 +190,14 @@ export class ObsidianFilesystemBridge implements FilesystemBridge {
     }
     if (this.expectedDeletes.delete(oldDocPath)) {
       this.expectedDeletes.add(newDocPath);
+    }
+    if (this.remoteFlushQuarantine.delete(oldDocPath)) {
+      this.remoteFlushQuarantine.add(newDocPath);
+    }
+    const generation = this.writeGenerations.get(oldDocPath);
+    if (generation !== undefined) {
+      this.writeGenerations.delete(oldDocPath);
+      this.writeGenerations.set(newDocPath, generation);
     }
     const observer = this.textObservers.get(oldDocPath);
     if (observer) {
@@ -280,6 +318,28 @@ export class ObsidianFilesystemBridge implements FilesystemBridge {
     }, 300);
   }
 
+  private currentWriteGeneration(docPath: string): number {
+    return this.writeGenerations.get(docPath) ?? 0;
+  }
+
+  private invalidateQueuedWrites(docPath: string): void {
+    this.writeGenerations.set(docPath, this.currentWriteGeneration(docPath) + 1);
+  }
+
+  private enqueueFlushFile(docPath: string, generation: number): Promise<void> {
+    const prev = this.writeQueues.get(docPath) ?? Promise.resolve();
+    const current = prev.then(() => this.doFlushFile(docPath, generation));
+    this.writeQueues.set(docPath, current.catch(() => {}));
+    return current;
+  }
+
+  private cancelOpenWriteTimer(docPath: string): void {
+    const timer = this.openWriteTimers.get(docPath);
+    if (!timer) return;
+    clearTimeout(timer);
+    this.openWriteTimers.delete(docPath);
+  }
+
   private attachTextObserver(docPath: string): void {
     if (this.textObservers.has(docPath)) return;
     const ytext = this.getYText(docPath);
@@ -307,8 +367,13 @@ export class ObsidianFilesystemBridge implements FilesystemBridge {
   }
 
   private scheduleOpenWrite(docPath: string): void {
+    if (this.remoteFlushQuarantine.has(docPath)) {
+      console.debug(`[SaltSync:Bridge] scheduleOpenWrite skipped (remote flush quarantined)`, { docPath });
+      return;
+    }
     const existing = this.openWriteTimers.get(docPath);
     if (existing) clearTimeout(existing);
+    const generation = this.currentWriteGeneration(docPath);
     const lastActivityAt = this.recentEditorActivity.get(docPath) ?? 0;
     const recentlyEdited = Date.now() - lastActivityAt < 1500;
     const vaultPath = this.toVaultPath(docPath);
@@ -326,7 +391,7 @@ export class ObsidianFilesystemBridge implements FilesystemBridge {
       docPath,
       setTimeout(() => {
         this.openWriteTimers.delete(docPath);
-        this.flushFile(docPath).catch((err) => {
+        this.enqueueFlushFile(docPath, generation).catch((err) => {
           console.error(`[SaltSync:Bridge] open flush error`, { docPath, err });
         });
       }, delay),
@@ -334,8 +399,12 @@ export class ObsidianFilesystemBridge implements FilesystemBridge {
   }
 
   private scheduleClosedWrite(docPath: string): void {
+    if (this.remoteFlushQuarantine.has(docPath)) {
+      console.debug(`[SaltSync:Bridge] scheduleClosedWrite skipped (remote flush quarantined)`, { docPath });
+      return;
+    }
     console.debug(`[SaltSync:Bridge] scheduleClosedWrite`, { docPath });
-    this.flushFile(docPath).catch((err) => {
+    this.enqueueFlushFile(docPath, this.currentWriteGeneration(docPath)).catch((err) => {
       console.error(`[SaltSync:Bridge] closed flush error`, { docPath, err });
     });
   }
@@ -343,7 +412,7 @@ export class ObsidianFilesystemBridge implements FilesystemBridge {
   /**
    * 磁盘 -> 共享状态：以 docPath 定位 Y.Text，以 vaultPath 读取磁盘文件。
    */
-  private async importFromDisk(docPath: string): Promise<void> {
+  private async importFromDisk(docPath: string, options: { force?: boolean } = {}): Promise<void> {
     const vaultPath = this.toVaultPath(docPath);
     const file = this.vault.getFileByPath(vaultPath) as TFile | null;
 
@@ -352,13 +421,15 @@ export class ObsidianFilesystemBridge implements FilesystemBridge {
       return;
     }
 
-    const decision = evaluateExternalEditPolicy(this.getExternalEditPolicy(), this.openDocPaths.has(docPath));
-    if (!decision.allowed) {
-      if (decision.deferred) {
-        this.deferredImports.add(docPath);
-        console.debug(`[SaltSync:Bridge] importFromDisk deferred (policy: ${decision.reason})`, { docPath });
+    if (!options.force) {
+      const decision = evaluateExternalEditPolicy(this.getExternalEditPolicy(), this.openDocPaths.has(docPath));
+      if (!decision.allowed) {
+        if (decision.deferred) {
+          this.deferredImports.add(docPath);
+          console.debug(`[SaltSync:Bridge] importFromDisk deferred (policy: ${decision.reason})`, { docPath });
+        }
+        return;
       }
-      return;
     }
 
     // When the file is open AND the editor binding is healthy, yCollab is the
@@ -368,7 +439,7 @@ export class ObsidianFilesystemBridge implements FilesystemBridge {
     //
     // We still allow import when the binding is NOT healthy (fallback mode) or
     // when the file is closed (no editor, disk is the only source of truth).
-    if (this.openDocPaths.has(docPath) && this.isBindingHealthy(vaultPath)) {
+    if (!options.force && this.openDocPaths.has(docPath) && this.isBindingHealthy(vaultPath)) {
       console.debug(`[SaltSync:Bridge] importFromDisk skipped (open file with healthy binding)`, { docPath });
       return;
     }
@@ -376,10 +447,8 @@ export class ObsidianFilesystemBridge implements FilesystemBridge {
     // importFromDisk now runs inside writeQueues (serialized with flushFile),
     // but a pending openWriteTimer could fire after we read disk and enqueue
     // a flush that overwrites our import. Cancel it — the import is fresher.
-    const pendingTimer = this.openWriteTimers.get(docPath);
-    if (pendingTimer) {
-      clearTimeout(pendingTimer);
-      this.openWriteTimers.delete(docPath);
+    if (this.openWriteTimers.has(docPath)) {
+      this.cancelOpenWriteTimer(docPath);
       console.info(`[SaltSync:Bridge] importFromDisk cancelled pending openWriteTimer`, { docPath });
     }
 
@@ -399,7 +468,10 @@ export class ObsidianFilesystemBridge implements FilesystemBridge {
   }
 
   /** 共享状态 -> 磁盘：实际写入逻辑，在串行队列中执行 */
-  private async doFlushFile(docPath: string): Promise<void> {
+  private async doFlushFile(docPath: string, generation: number): Promise<void> {
+    if (this.remoteFlushQuarantine.has(docPath)) return;
+    if (generation !== this.currentWriteGeneration(docPath)) return;
+
     const ytext = this.getYText(docPath);
     if (!ytext) return;
 
