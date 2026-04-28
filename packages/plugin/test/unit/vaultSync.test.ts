@@ -2,10 +2,11 @@ import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vite
 import 'fake-indexeddb/auto';
 import * as Y from 'yjs';
 import { VaultSyncEngine } from '../../src/sync/vaultSync';
+import { ObsidianFilesystemBridge } from '../../src/sync/filesystemBridge';
 import type { Plugin } from 'obsidian';
 import type { SaltSyncSettings } from '../../src/settings';
 import type { SharedDirectoryMount, FileTombstone } from '@salt-sync/shared';
-import { MockPlugin } from '../mocks/obsidian';
+import { MockPlugin, MockVault } from '../mocks/obsidian';
 
 function baseSettings(): SaltSyncSettings {
   return {
@@ -21,6 +22,10 @@ function baseSettings(): SaltSyncSettings {
 function fakePlugin(): Plugin {
   // VaultSyncEngine's ctor only stores the reference — start() is what touches it.
   return {} as unknown as Plugin;
+}
+
+function flushPromises(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 function internals(engine: VaultSyncEngine) {
@@ -130,6 +135,76 @@ describe('VaultSyncEngine', () => {
       }, 'remote');
 
       expect(renameTarget(engine, 'old.md', remoteTxn!)).toBe('new.md');
+    });
+  });
+
+  describe('remote markdown tombstones', () => {
+    function setupRemoteTombstone(initialSyncComplete: boolean) {
+      const engine = new VaultSyncEngine(fakePlugin(), baseSettings(), null);
+      const vault = new MockVault();
+      vault.seedText('kept.md', 'local content');
+      const { ydoc, tombstones } = internals(engine);
+      const self = engine as unknown as {
+        bridge: ObsidianFilesystemBridge;
+        blobSync: { handleRemoteBlobChanges: (txn: Y.Transaction) => Promise<void> };
+        editorBindings: { unbindByPath: (path: string) => void };
+        initialSyncComplete: boolean;
+        handleRemoteTransactionSideEffects: (txn: Y.Transaction) => void;
+      };
+      self.bridge = new ObsidianFilesystemBridge(vault as never, () => null, ydoc, 'primary');
+      self.blobSync = { handleRemoteBlobChanges: vi.fn(async () => {}) };
+      self.editorBindings = { unbindByPath: vi.fn() };
+      self.initialSyncComplete = initialSyncComplete;
+      const deleteSpy = vi.spyOn(vault, 'delete');
+
+      let remoteTxn: Y.Transaction | null = null;
+      ydoc.on('afterTransaction', (txn) => {
+        if (txn.origin === 'remote') remoteTxn = txn;
+      });
+      ydoc.transact(() => {
+        tombstones.set('kept.md', { deletedAt: new Date().toISOString() });
+      }, 'remote');
+
+      return { self, vault, tombstones, deleteSpy, remoteTxn: remoteTxn! };
+    }
+
+    it('does not delete local files for tombstones received before initial sync completes', async () => {
+      const { self, vault, tombstones, deleteSpy, remoteTxn } = setupRemoteTombstone(false);
+
+      self.handleRemoteTransactionSideEffects(remoteTxn);
+      await flushPromises();
+
+      expect(deleteSpy).not.toHaveBeenCalled();
+      expect(vault.getFileByPath('kept.md')).not.toBeNull();
+      expect(tombstones.has('kept.md')).toBe(true);
+    });
+
+    it('deletes local files for tombstones received after initial sync completes', async () => {
+      const { self, vault, deleteSpy, remoteTxn } = setupRemoteTombstone(true);
+
+      self.handleRemoteTransactionSideEffects(remoteTxn);
+      await flushPromises();
+
+      expect(deleteSpy).toHaveBeenCalledTimes(1);
+      expect(vault.getFileByPath('kept.md')).toBeNull();
+    });
+
+    it('clears a polluted server tombstone when the file exists during reconcile', async () => {
+      const plugin = new MockPlugin();
+      plugin.app.vault.seedText('recovered.md', 'recovered content');
+      const engine = new VaultSyncEngine(plugin as never, baseSettings(), null);
+      const { ydoc, tombstones } = internals(engine);
+      const self = engine as unknown as {
+        bridge: ObsidianFilesystemBridge;
+        reconcile: () => Promise<void>;
+      };
+      self.bridge = new ObsidianFilesystemBridge(plugin.app.vault as never, () => null, ydoc, 'primary');
+      tombstones.set('recovered.md', { deletedAt: new Date().toISOString() });
+
+      await self.reconcile();
+
+      expect(tombstones.has('recovered.md')).toBe(false);
+      expect(plugin.app.vault.getFileByPath('recovered.md')).not.toBeNull();
     });
   });
 

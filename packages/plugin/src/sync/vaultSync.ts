@@ -374,54 +374,7 @@ export class VaultSyncEngine implements SyncEngine {
     // Flush changed files / blobs to disk after remote updates
     this.ydoc.on('afterTransaction', (txn: Y.Transaction) => {
       if (txn.origin !== 'remote') return;
-
-      const changedDocIds = mapChanged(txn, this.docs) ? changedMapKeys(txn, this.docs) : [];
-      this.bridge.handleRemoteTransaction(txn, this.docs, this.idToPath, changedDocIds);
-
-      // 远端 markdown 删除 → 本地删除对应文件
-      const tombMap = this.fileTombstones;
-      if (mapChanged(txn, tombMap)) {
-        for (const docPath of changedMapKeys(txn, tombMap)) {
-          if (tombMap.has(docPath)) {
-            this.editorBindings.unbindByPath(this.toVaultPath(docPath));
-            this.bridge.notifyFileClosed(this.toVaultPath(docPath));
-            this.bridge.deleteFile(docPath).catch((err) => {
-              console.error(`[VaultSync] deleteFile error for ${docPath}:`, err);
-            });
-          }
-        }
-      }
-
-      // 远端 markdown 重命名 → 本地同步路径变更
-      // rename 只改 pathToId/idToPath，不改 docs（Y.Text 内容不变），
-      // handleRemoteTransaction 检测不到，需要单独处理。
-      if (mapChanged(txn, this.pathToId)) {
-        for (const docPath of changedMapKeys(txn, this.pathToId)) {
-          const fileId = this.pathToId.get(docPath);
-          if (!fileId) {
-            // 路径从 pathToId 中移除：只有同一事务能证明它是单目标 rename 的源路径时，才清理本地旧路径。
-            if (!this.fileTombstones.has(docPath) && this.getUnambiguousRemoteRenameTarget(docPath, txn)) {
-              this.editorBindings.unbindByPath(this.toVaultPath(docPath));
-              this.bridge.notifyFileClosed(this.toVaultPath(docPath));
-              this.bridge.deleteFile(docPath).catch((err) => {
-                console.error(`[VaultSync] remote rename cleanup error for ${docPath}:`, err);
-              });
-            }
-          } else {
-            // 路径新增到 pathToId：如果 docs 有对应 Y.Text 且本地无该文件，
-            // 说明是 rename 的目标路径，物化到磁盘。
-            if (this.docs.get(fileId) && !this.plugin.app.vault.getAbstractFileByPath(this.toVaultPath(docPath))) {
-              this.bridge.flushFile(docPath).catch((err) => {
-                console.error(`[VaultSync] remote rename flush error for ${docPath}:`, err);
-              });
-            }
-          }
-        }
-      }
-
-      this.blobSync.handleRemoteBlobChanges(txn).catch((err) => {
-        console.error('[VaultSync] blobSync remote changes error:', err);
-      });
+      this.handleRemoteTransactionSideEffects(txn);
     });
 
     // Handle incoming server messages
@@ -656,6 +609,12 @@ export class VaultSyncEngine implements SyncEngine {
       localDocPaths.add(docPath);
       this.knownLocalMarkdownPaths.add(docPath);
       this.getOrCreateYText(docPath);
+      if (this.fileTombstones.has(docPath)) {
+        // A local file that is present during authoritative startup reconcile is
+        // stronger evidence than a legacy server tombstone. Clear the tombstone
+        // so polluted server state converges back to the user's recovered file.
+        this.fileTombstones.delete(docPath);
+      }
       this.bridge.markDirty(file.path); // markDirty takes vaultPath, bridge converts
     }
     await this.bridge.drain();
@@ -911,6 +870,59 @@ export class VaultSyncEngine implements SyncEngine {
       return changedPath !== removedDocPath && this.pathToId.get(changedPath) === removedFileId;
     });
     return targets.length === 1 ? targets[0] : null;
+  }
+
+  private handleRemoteTransactionSideEffects(txn: Y.Transaction): void {
+    const changedDocIds = mapChanged(txn, this.docs) ? changedMapKeys(txn, this.docs) : [];
+    this.bridge.handleRemoteTransaction(txn, this.docs, this.idToPath, changedDocIds);
+
+    // 远端 markdown 删除 → 本地删除对应文件。
+    // 首次同步前到达的 tombstone may be legacy server pollution; keep the model state
+    // but do not convert it into a local user-file delete. Future remote tombstones
+    // after initial sync still apply normally.
+    const tombMap = this.fileTombstones;
+    if (this.initialSyncComplete && mapChanged(txn, tombMap)) {
+      for (const docPath of changedMapKeys(txn, tombMap)) {
+        if (tombMap.has(docPath)) {
+          this.editorBindings.unbindByPath(this.toVaultPath(docPath));
+          this.bridge.notifyFileClosed(this.toVaultPath(docPath));
+          this.bridge.deleteFile(docPath).catch((err) => {
+            console.error(`[VaultSync] deleteFile error for ${docPath}:`, err);
+          });
+        }
+      }
+    }
+
+    // 远端 markdown 重命名 → 本地同步路径变更
+    // rename 只改 pathToId/idToPath，不改 docs（Y.Text 内容不变），
+    // handleRemoteTransaction 检测不到，需要单独处理。
+    if (mapChanged(txn, this.pathToId)) {
+      for (const docPath of changedMapKeys(txn, this.pathToId)) {
+        const fileId = this.pathToId.get(docPath);
+        if (!fileId) {
+          // 路径从 pathToId 中移除：只有同一事务能证明它是单目标 rename 的源路径时，才清理本地旧路径。
+          if (!this.fileTombstones.has(docPath) && this.getUnambiguousRemoteRenameTarget(docPath, txn)) {
+            this.editorBindings.unbindByPath(this.toVaultPath(docPath));
+            this.bridge.notifyFileClosed(this.toVaultPath(docPath));
+            this.bridge.deleteFile(docPath).catch((err) => {
+              console.error(`[VaultSync] remote rename cleanup error for ${docPath}:`, err);
+            });
+          }
+        } else {
+          // 路径新增到 pathToId：如果 docs 有对应 Y.Text 且本地无该文件，
+          // 说明是 rename 的目标路径，物化到磁盘。
+          if (this.docs.get(fileId) && !this.plugin.app.vault.getAbstractFileByPath(this.toVaultPath(docPath))) {
+            this.bridge.flushFile(docPath).catch((err) => {
+              console.error(`[VaultSync] remote rename flush error for ${docPath}:`, err);
+            });
+          }
+        }
+      }
+    }
+
+    this.blobSync.handleRemoteBlobChanges(txn).catch((err) => {
+      console.error('[VaultSync] blobSync remote changes error:', err);
+    });
   }
 
   private getOpenMarkdownViews(): MarkdownView[] {

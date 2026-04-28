@@ -427,6 +427,8 @@ describe('BlobSync reconcile', () => {
     const vault = new MockVault();
     const ydoc = new Y.Doc();
     vault.seedFolder('assets/folder.png');
+    const sync = new BlobSync('ws://server.test', 'vault-a', 'token-a', vault as never, ydoc);
+    await sync.openRemoteApplyGate();
     let remoteTxn: Y.Transaction | null = null;
     ydoc.on('afterTransaction', (txn) => {
       if (txn.origin === 'remote') remoteTxn = txn;
@@ -439,11 +441,86 @@ describe('BlobSync reconcile', () => {
       });
     }, 'remote');
 
+    await sync.handleRemoteBlobChanges(remoteTxn!);
+
+    expect(vault.getAbstractFileByPath('assets/folder.png')).toBe(vault.folders.get('assets/folder.png'));
+  });
+
+  it('does not delete local files for blob tombstones received before the startup gate opens', async () => {
+    const vault = new MockVault();
+    const ydoc = new Y.Doc();
+    vault.seedBinary('assets/kept.png', new Uint8Array([1, 2, 3]));
     const sync = new BlobSync('ws://server.test', 'vault-a', 'token-a', vault as never, ydoc);
+    const deleteSpy = vi.spyOn(vault, 'delete');
+    let remoteTxn: Y.Transaction | null = null;
+    ydoc.on('afterTransaction', (txn) => {
+      if (txn.origin === 'remote') remoteTxn = txn;
+    });
+
+    ydoc.transact(() => {
+      (ydoc.getMap('blobTombstones') as Y.Map<{ hash: string; deletedAt: string }>).set('assets/kept.png', {
+        hash: 'legacy-hash',
+        deletedAt: new Date().toISOString(),
+      });
+    }, 'remote');
+
     await sync.handleRemoteBlobChanges(remoteTxn!);
     await sync.openRemoteApplyGate();
 
-    expect(vault.getAbstractFileByPath('assets/folder.png')).toBe(vault.folders.get('assets/folder.png'));
+    expect(deleteSpy).not.toHaveBeenCalled();
+    expect(vault.getFileByPath('assets/kept.png')).not.toBeNull();
+    expect((ydoc.getMap('blobTombstones') as Y.Map<unknown>).has('assets/kept.png')).toBe(true);
+  });
+
+  it('deletes local files for blob tombstones received after the startup gate opens', async () => {
+    const vault = new MockVault();
+    const ydoc = new Y.Doc();
+    vault.seedBinary('assets/deleted.png', new Uint8Array([1, 2, 3]));
+    const sync = new BlobSync('ws://server.test', 'vault-a', 'token-a', vault as never, ydoc);
+    await sync.openRemoteApplyGate();
+    const deleteSpy = vi.spyOn(vault, 'delete');
+    let remoteTxn: Y.Transaction | null = null;
+    ydoc.on('afterTransaction', (txn) => {
+      if (txn.origin === 'remote') remoteTxn = txn;
+    });
+
+    ydoc.transact(() => {
+      (ydoc.getMap('blobTombstones') as Y.Map<{ hash: string; deletedAt: string }>).set('assets/deleted.png', {
+        hash: 'future-hash',
+        deletedAt: new Date().toISOString(),
+      });
+    }, 'remote');
+
+    await sync.handleRemoteBlobChanges(remoteTxn!);
+
+    expect(deleteSpy).toHaveBeenCalledTimes(1);
+    expect(vault.getFileByPath('assets/deleted.png')).toBeNull();
+  });
+
+  it('clears a polluted blob tombstone when the local file exists during authoritative reconcile', async () => {
+    const vault = new MockVault();
+    const ydoc = new Y.Doc();
+    const bytes = new Uint8Array([9, 8, 7]);
+    const hash = sha256hex(bytes);
+    vault.seedBinary('assets/recovered.png', bytes);
+    (ydoc.getMap('pathToBlob') as Y.Map<{ hash: string; size: number; contentType: string; updatedAt: string }>).set('assets/recovered.png', {
+      hash,
+      size: bytes.byteLength,
+      contentType: 'image/png',
+      updatedAt: new Date().toISOString(),
+    });
+    (ydoc.getMap('blobTombstones') as Y.Map<{ hash: string; deletedAt: string }>).set('assets/recovered.png', {
+      hash,
+      deletedAt: new Date().toISOString(),
+    });
+    const sync = new BlobSync('ws://server.test', 'vault-a', 'token-a', vault as never, ydoc);
+    const deleteSpy = vi.spyOn(vault, 'delete');
+
+    await sync.reconcile('authoritative');
+
+    expect(deleteSpy).not.toHaveBeenCalled();
+    expect((ydoc.getMap('blobTombstones') as Y.Map<unknown>).has('assets/recovered.png')).toBe(false);
+    expect(vault.getFileByPath('assets/recovered.png')).not.toBeNull();
   });
 
   it('reconcile ignores Obsidian trash and Syncthing artifact blobs', async () => {

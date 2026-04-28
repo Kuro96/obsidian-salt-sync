@@ -174,11 +174,19 @@ export class BlobSync {
     if (mapChanged(txn, tombMap)) {
       for (const path of changedMapKeys(txn, tombMap)) {
         if (tombMap.has(path)) {
-          this.pendingRemoteDownloads.delete(path);
-          this.notifyPendingDownloadsChange();
-          this.pendingRemoteDeletes.add(path);
-          this.notifyPendingRemoteDeletesChange();
-          this.persistRuntimeState();
+          const removedPendingDownload = this.pendingRemoteDownloads.delete(path);
+          if (removedPendingDownload) {
+            this.notifyPendingDownloadsChange();
+            this.persistRuntimeState();
+          }
+          // Tombstones received during the startup gate may be legacy server
+          // pollution. Keep them in the shared model but do not queue local
+          // delete side effects until future changes arrive after startup.
+          if (this.gateState !== 'startup-blocked') {
+            this.pendingRemoteDeletes.add(path);
+            this.notifyPendingRemoteDeletesChange();
+            this.persistRuntimeState();
+          }
         }
       }
     }
@@ -518,6 +526,10 @@ export class BlobSync {
 
       const localHash = await this.getLocalBlobHash(docPath, file);
       this.knownLocalPaths.add(docPath);
+      if (this.blobTombstones.has(docPath) && mode === 'authoritative') {
+        await this.handleLocalBlobChange(docPath);
+        continue;
+      }
       if (ref.hash !== localHash && mode === 'authoritative') {
         await this.handleLocalBlobChange(docPath);
       }
@@ -665,6 +677,11 @@ export class BlobSync {
 
       const existingRef = this.pathToBlob.get(path);
       if (existingRef?.hash === hash) {
+        if (this.blobTombstones.has(path)) {
+          this.ydoc.transact(() => {
+            this.blobTombstones.delete(path);
+          }, 'local-blob');
+        }
         completed = true;
         return;
       }
