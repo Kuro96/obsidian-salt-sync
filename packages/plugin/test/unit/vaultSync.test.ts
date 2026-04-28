@@ -304,7 +304,7 @@ describe('VaultSyncEngine', () => {
       expect(tombstones.has('kept.md')).toBe(true);
     });
 
-    it('keeps the markdown delete gate closed for pending remote tombstones when startup reconcile throws', async () => {
+    it('does not open destructive markdown replay when startup reconcile throws', async () => {
       const plugin = new MockPlugin();
       plugin.app.vault.seedText('kept.md', 'local content');
       const engine = new VaultSyncEngine(plugin as unknown as Plugin, baseSettings(), null);
@@ -314,6 +314,7 @@ describe('VaultSyncEngine', () => {
         blobSync: { handleRemoteBlobChanges: (txn: Y.Transaction) => Promise<void> };
         editorBindings: { unbindByPath: (path: string) => void };
         remoteFileDeleteSideEffectsOpen: boolean;
+        markdownDeleteGateState: string;
         reconcile: () => Promise<void>;
         runBlobMaintenance: () => Promise<void>;
         bindAllOpenEditors: () => void;
@@ -353,6 +354,7 @@ describe('VaultSyncEngine', () => {
       await expect(startup).rejects.toThrow('reconcile failed');
 
       expect(self.remoteFileDeleteSideEffectsOpen).toBe(false);
+      expect(self.markdownDeleteGateState).toBe('maintenance-blocked');
       expect(deleteSpy).not.toHaveBeenCalled();
       expect(plugin.app.vault.getFileByPath('kept.md')).not.toBeNull();
       expect(tombstones.has('kept.md')).toBe(true);
@@ -396,6 +398,238 @@ describe('VaultSyncEngine', () => {
 
       expect(tombstones.has('recovered.md')).toBe(false);
       expect(plugin.app.vault.getFileByPath('recovered.md')).not.toBeNull();
+    });
+
+    it('classifies same-path startup remote tombstone with recovered local file as stale without flushing remote content', async () => {
+      const plugin = new MockPlugin();
+      plugin.app.vault.seedText('recovered.md', 'local recovered content');
+      const engine = new VaultSyncEngine(plugin as unknown as Plugin, baseSettings(), null);
+      const { ydoc, pathToId, idToPath, docs, tombstones } = internals(engine);
+      const self = engine as unknown as {
+        bridge: ObsidianFilesystemBridge;
+        blobSync: { handleRemoteBlobChanges: (txn: Y.Transaction) => Promise<void> };
+        editorBindings: { unbindByPath: (path: string) => void };
+        runBlobMaintenance: () => Promise<void>;
+        bindAllOpenEditors: () => void;
+        validateAllOpenBindings: () => void;
+        notifyStatusChange: () => void;
+        completeInitialSync: () => Promise<void>;
+        handleRemoteTransactionSideEffects: (txn: Y.Transaction) => void;
+      };
+      self.bridge = new ObsidianFilesystemBridge(
+        plugin.app.vault as never,
+        (docPath) => docs.get(pathToId.get(docPath) ?? '') ?? null,
+        ydoc,
+        'primary',
+      );
+      self.blobSync = { handleRemoteBlobChanges: vi.fn(async () => {}) };
+      self.editorBindings = { unbindByPath: vi.fn() };
+      self.runBlobMaintenance = async () => {};
+      self.bindAllOpenEditors = () => {};
+      self.validateAllOpenBindings = () => {};
+      self.notifyStatusChange = () => {};
+      const deleteSpy = vi.spyOn(plugin.app.vault, 'delete');
+
+      let remoteTxn: Y.Transaction | null = null;
+      ydoc.on('afterTransaction', (txn) => {
+        if (txn.origin === 'remote') remoteTxn = txn;
+      });
+      ydoc.transact(() => {
+        const text = new Y.Text();
+        text.insert(0, 'stale remote content');
+        pathToId.set('recovered.md', 'file-recovered');
+        idToPath.set('file-recovered', 'recovered.md');
+        docs.set('file-recovered', text);
+        tombstones.set('recovered.md', { deletedAt: new Date().toISOString() });
+      }, 'remote');
+
+      self.handleRemoteTransactionSideEffects(remoteTxn!);
+      await flushPromises();
+      await self.completeInitialSync();
+      await flushPromises();
+
+      expect(deleteSpy).not.toHaveBeenCalled();
+      expect(plugin.app.vault.getFileByPath('recovered.md')).not.toBeNull();
+      await expect(plugin.app.vault.read(plugin.app.vault.getFileByPath('recovered.md')!)).resolves.toBe('local recovered content');
+      expect(tombstones.has('recovered.md')).toBe(false);
+      expect(docs.get(pathToId.get('recovered.md')!)?.toString()).toBe('local recovered content');
+    });
+
+    it('classifies cached startup tombstone through start cache path with writable recovered local as stale', async () => {
+      const plugin = new MockPlugin();
+      plugin.app.vault.seedText('cached.md', 'local cached recovery');
+      const cacheDoc = new Y.Doc();
+      const cachePathToId = cacheDoc.getMap('pathToId') as Y.Map<string>;
+      const cacheIdToPath = cacheDoc.getMap('idToPath') as Y.Map<string>;
+      const cacheDocs = cacheDoc.getMap('docs') as Y.Map<Y.Text>;
+      const cacheTombstones = cacheDoc.getMap('fileTombstones') as Y.Map<FileTombstone>;
+      const staleText = new Y.Text();
+      staleText.insert(0, 'cached stale remote');
+      cachePathToId.set('cached.md', 'file-cached');
+      cacheIdToPath.set('file-cached', 'cached.md');
+      cacheDocs.set('file-cached', staleText);
+      cacheTombstones.set('cached.md', { deletedAt: new Date().toISOString() });
+
+      const engine = new VaultSyncEngine(plugin as unknown as Plugin, baseSettings(), null);
+      const self = engine as unknown as {
+        cache: { clearLegacyVaultOnlyKey: () => Promise<boolean>; load: () => Promise<{ vaultId: string; ydocUpdate: Uint8Array; updatedAt: string }>; save: () => Promise<void> };
+        client: { connect: () => Promise<void>; onMessage: () => void; onStatusChange: () => void; send: () => Promise<void>; disconnect: () => Promise<void> };
+        blobSync: { restoreRuntimeState: () => Promise<void>; reconcile: () => Promise<void>; enterMaintenanceGate: () => void; openRemoteApplyGate: () => Promise<void> };
+        runBlobMaintenance: () => Promise<void>;
+        completeInitialSync: () => Promise<void>;
+      };
+      self.cache = {
+        clearLegacyVaultOnlyKey: async () => false,
+        load: async () => ({ vaultId: 'primary', ydocUpdate: Y.encodeStateAsUpdate(cacheDoc), updatedAt: new Date().toISOString() }),
+        save: async () => {},
+      };
+      self.client = { connect: async () => {}, onMessage: () => {}, onStatusChange: () => {}, send: async () => {}, disconnect: async () => {} };
+      self.runBlobMaintenance = async () => {};
+      const deleteSpy = vi.spyOn(plugin.app.vault, 'delete');
+
+      await engine.start();
+      await self.completeInitialSync();
+      await flushPromises();
+
+      const { pathToId, docs, tombstones } = internals(engine);
+      expect(deleteSpy).not.toHaveBeenCalled();
+      expect(plugin.app.vault.getFileByPath('cached.md')).not.toBeNull();
+      expect(tombstones.has('cached.md')).toBe(false);
+      expect(docs.get(pathToId.get('cached.md')!)?.toString()).toBe('local cached recovery');
+      await engine.stop();
+    });
+
+    it('keeps startup tombstone when force-import of recovered local file fails', async () => {
+      const plugin = new MockPlugin();
+      plugin.app.vault.seedText('recover-fails.md', 'local recovery');
+      const engine = new VaultSyncEngine(plugin as unknown as Plugin, baseSettings(), null);
+      const { ydoc, pathToId, idToPath, docs, tombstones } = internals(engine);
+      const self = engine as unknown as {
+        bridge: ObsidianFilesystemBridge;
+        blobSync: { handleRemoteBlobChanges: (txn: Y.Transaction) => Promise<void> };
+        editorBindings: { unbindByPath: (path: string) => void };
+        runBlobMaintenance: () => Promise<void>;
+        completeInitialSync: () => Promise<void>;
+        handleRemoteTransactionSideEffects: (txn: Y.Transaction) => void;
+      };
+      self.bridge = new ObsidianFilesystemBridge(
+        plugin.app.vault as never,
+        (docPath) => docs.get(pathToId.get(docPath) ?? '') ?? null,
+        ydoc,
+        'primary',
+      );
+      self.blobSync = { handleRemoteBlobChanges: vi.fn(async () => {}) };
+      self.editorBindings = { unbindByPath: vi.fn() };
+      self.runBlobMaintenance = async () => {};
+      vi.spyOn(self.bridge, 'forceImportFromDisk').mockRejectedValueOnce(new Error('disk import failed'));
+      let remoteTxn: Y.Transaction | null = null;
+      ydoc.on('afterTransaction', (txn) => {
+        if (txn.origin === 'remote') remoteTxn = txn;
+      });
+      ydoc.transact(() => {
+        const text = new Y.Text();
+        text.insert(0, 'stale remote');
+        pathToId.set('recover-fails.md', 'file-recover-fails');
+        idToPath.set('file-recover-fails', 'recover-fails.md');
+        docs.set('file-recover-fails', text);
+        tombstones.set('recover-fails.md', { deletedAt: new Date().toISOString() });
+      }, 'remote');
+
+      self.handleRemoteTransactionSideEffects(remoteTxn!);
+      await expect(self.completeInitialSync()).rejects.toThrow('disk import failed');
+
+      expect(tombstones.has('recover-fails.md')).toBe(true);
+      expect(docs.get(pathToId.get('recover-fails.md')!)?.toString()).toBe('stale remote');
+      await expect(plugin.app.vault.read(plugin.app.vault.getFileByPath('recover-fails.md')!)).resolves.toBe('local recovery');
+    });
+
+    it('releases quarantine for authoritative startup tombstone when remote later restores the file', async () => {
+      const plugin = new MockPlugin();
+      const cacheDoc = new Y.Doc();
+      const cachePathToId = cacheDoc.getMap('pathToId') as Y.Map<string>;
+      const cacheIdToPath = cacheDoc.getMap('idToPath') as Y.Map<string>;
+      const cacheDocs = cacheDoc.getMap('docs') as Y.Map<Y.Text>;
+      const cacheTombstones = cacheDoc.getMap('fileTombstones') as Y.Map<FileTombstone>;
+      const text = new Y.Text();
+      text.insert(0, 'deleted snapshot');
+      cachePathToId.set('restored.md', 'file-restored');
+      cacheIdToPath.set('file-restored', 'restored.md');
+      cacheDocs.set('file-restored', text);
+      cacheTombstones.set('restored.md', { deletedAt: new Date().toISOString() });
+
+      const engine = new VaultSyncEngine(plugin as unknown as Plugin, baseSettings(), null);
+      const self = engine as unknown as {
+        cache: { clearLegacyVaultOnlyKey: () => Promise<boolean>; load: () => Promise<{ vaultId: string; ydocUpdate: Uint8Array; updatedAt: string }>; save: () => Promise<void> };
+        client: { connect: () => Promise<void>; onMessage: () => void; onStatusChange: () => void; send: () => Promise<void>; disconnect: () => Promise<void> };
+        runBlobMaintenance: () => Promise<void>;
+        completeInitialSync: () => Promise<void>;
+        handleRemoteTransactionSideEffects: (txn: Y.Transaction) => void;
+        bridge: ObsidianFilesystemBridge;
+      };
+      self.cache = {
+        clearLegacyVaultOnlyKey: async () => false,
+        load: async () => ({ vaultId: 'primary', ydocUpdate: Y.encodeStateAsUpdate(cacheDoc), updatedAt: new Date().toISOString() }),
+        save: async () => {},
+      };
+      self.client = { connect: async () => {}, onMessage: () => {}, onStatusChange: () => {}, send: async () => {}, disconnect: async () => {} };
+      self.runBlobMaintenance = async () => {};
+
+      await engine.start();
+      await self.completeInitialSync();
+      expect((self.bridge as unknown as { remoteFlushQuarantine: Set<string> }).remoteFlushQuarantine.has('restored.md')).toBe(false);
+      const { ydoc, docs, tombstones } = internals(engine);
+      let remoteTxn: Y.Transaction | null = null;
+      ydoc.on('afterTransaction', (txn) => {
+        if (txn.origin === 'remote') remoteTxn = txn;
+      });
+      ydoc.transact(() => {
+        tombstones.delete('restored.md');
+        docs.get('file-restored')!.delete(0, docs.get('file-restored')!.length);
+        docs.get('file-restored')!.insert(0, 'remote restored');
+      }, 'remote');
+
+      self.handleRemoteTransactionSideEffects(remoteTxn!);
+      await flushPromises();
+
+      expect(plugin.app.vault.getFileByPath('restored.md')).not.toBeNull();
+      await expect(plugin.app.vault.read(plugin.app.vault.getFileByPath('restored.md')!)).resolves.toBe('remote restored');
+      await engine.stop();
+    });
+
+    it('keeps read-only cached startup tombstone authoritative and deletes local copy', async () => {
+      const plugin = new MockPlugin();
+      plugin.app.vault.seedText('Shared/deleted.md', 'read only local copy');
+      const cacheDoc = new Y.Doc();
+      (cacheDoc.getMap('pathToId') as Y.Map<string>).set('deleted.md', 'file-deleted');
+      (cacheDoc.getMap('idToPath') as Y.Map<string>).set('file-deleted', 'deleted.md');
+      const text = new Y.Text();
+      text.insert(0, 'remote stale');
+      (cacheDoc.getMap('docs') as Y.Map<Y.Text>).set('file-deleted', text);
+      (cacheDoc.getMap('fileTombstones') as Y.Map<FileTombstone>).set('deleted.md', { deletedAt: new Date().toISOString() });
+      const engine = new VaultSyncEngine(plugin as unknown as Plugin, baseSettings(), readOnlyMount);
+      const self = engine as unknown as {
+        cache: { clearLegacyVaultOnlyKey: () => Promise<boolean>; load: () => Promise<{ vaultId: string; ydocUpdate: Uint8Array; updatedAt: string }>; save: () => Promise<void> };
+        client: { connect: () => Promise<void>; onMessage: () => void; onStatusChange: () => void; send: () => Promise<void>; disconnect: () => Promise<void> };
+        runBlobMaintenance: () => Promise<void>;
+        completeInitialSync: () => Promise<void>;
+      };
+      self.cache = {
+        clearLegacyVaultOnlyKey: async () => false,
+        load: async () => ({ vaultId: 'shared1', ydocUpdate: Y.encodeStateAsUpdate(cacheDoc), updatedAt: new Date().toISOString() }),
+        save: async () => {},
+      };
+      self.client = { connect: async () => {}, onMessage: () => {}, onStatusChange: () => {}, send: async () => {}, disconnect: async () => {} };
+      self.runBlobMaintenance = async () => {};
+      const deleteSpy = vi.spyOn(plugin.app.vault, 'delete');
+
+      await engine.start();
+      await self.completeInitialSync();
+      await flushPromises();
+
+      expect(deleteSpy).toHaveBeenCalledTimes(1);
+      expect(plugin.app.vault.getFileByPath('Shared/deleted.md')).toBeNull();
+      expect(internals(engine).tombstones.has('deleted.md')).toBe(true);
+      await engine.stop();
     });
   });
 

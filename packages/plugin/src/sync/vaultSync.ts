@@ -21,6 +21,7 @@ import { BlobSync } from './blobSync';
 import { applyDiffToYText } from './diff';
 import { randomUUID, changedMapKeys, mapChanged } from '../util';
 import { isPathIgnoredBySync, isSameOrChildPath, normalizeVaultPath } from './pathSafety';
+import { MarkdownTombstoneState, type TombstoneReceiptOrigin, type TombstoneReceiptProvenance } from './markdownTombstoneState';
 
 // ── Sync status types ─────────────────────────────────────────────────────────
 
@@ -108,7 +109,7 @@ export class VaultSyncEngine implements SyncEngine {
   private initialSyncComplete = false;
   private markdownDeleteGateState: MarkdownDeleteGateState = 'startup-blocked';
   private readonly pendingRemoteMarkdownDeletes = new Set<string>();
-  private readonly startupRemoteMarkdownDeletes = new Set<string>();
+  private readonly markdownTombstones = new MarkdownTombstoneState();
   private blobMaintenancePaused = true;
   private clientStatus: ConnectionStatus = 'idle';
   private statusHandlers: Array<(status: SyncStatus) => void> = [];
@@ -370,13 +371,6 @@ export class VaultSyncEngine implements SyncEngine {
     this.blobSync.onPendingRemoteDeletesChange(() => this.notifyStatusChange());
     this.blobSync.onPendingLocalDeletionsChange(() => this.notifyStatusChange());
 
-    // Restore local cache
-    await this.clearLegacyLocalCache();
-    const cached = await this.cache.load(this.localCacheKey);
-    if (cached) {
-      Y.applyUpdate(this.ydoc, cached.ydocUpdate, 'cache');
-    }
-
     // Propagate local Y.Doc updates to server
     this.ydoc.on('update', (update: Uint8Array, origin: unknown) => {
       if (origin === 'remote' || origin === 'cache' || origin === 'load') return;
@@ -385,11 +379,22 @@ export class VaultSyncEngine implements SyncEngine {
       this.scheduleCacheSave();
     });
 
-    // Flush changed files / blobs to disk after remote updates
+    // Track markdown tombstone provenance for both cached startup state and remote updates.
     this.ydoc.on('afterTransaction', (txn: Y.Transaction) => {
-      if (txn.origin !== 'remote') return;
-      this.handleRemoteTransactionSideEffects(txn);
+      if (txn.origin === 'remote') {
+        this.handleRemoteTransactionSideEffects(txn);
+      } else {
+        this.recordMarkdownTombstoneTransaction(txn);
+      }
     });
+
+    // Restore local cache after transaction observers are registered so cached
+    // startup tombstones are classified before initial reconcile.
+    await this.clearLegacyLocalCache();
+    const cached = await this.cache.load(this.localCacheKey);
+    if (cached) {
+      Y.applyUpdate(this.ydoc, cached.ydocUpdate, 'cache');
+    }
 
     // Handle incoming server messages
     this.client.onMessage(async (msg) => {
@@ -603,12 +608,14 @@ export class VaultSyncEngine implements SyncEngine {
     const paths: string[] = [];
     for (const [docPath] of this.pathToId) {
       if (this.fileTombstones.has(docPath)) {
+        this.markdownTombstones.classifyBaseline(docPath, 'authoritative-delete');
         this.queueRemoteMarkdownDelete(docPath);
         continue;
       }
       paths.push(docPath);
     }
     for (const docPath of this.fileTombstones.keys()) {
+      this.markdownTombstones.classifyBaseline(docPath, 'authoritative-delete');
       this.queueRemoteMarkdownDelete(docPath);
     }
     for (const docPath of paths) {
@@ -631,11 +638,26 @@ export class VaultSyncEngine implements SyncEngine {
       const docPath = this.toDocPath(file.path);
       localDocPaths.add(docPath);
       this.knownLocalMarkdownPaths.add(docPath);
-      if (this.fileTombstones.has(docPath) && this.pendingRemoteMarkdownDeletes.has(docPath)) {
-        continue;
-      }
       this.getOrCreateYText(docPath);
       if (this.fileTombstones.has(docPath)) {
+        const decision = this.markdownTombstones.getDecision(docPath);
+        if (decision.kind === 'startup-baseline') {
+          this.bridge.quarantineRemoteFlushes([docPath]);
+          try {
+            await this.bridge.forceImportFromDisk(docPath);
+            this.fileTombstones.delete(docPath);
+            this.markdownTombstones.classifyBaseline(docPath, 'stale-cleared');
+          } catch (err) {
+            this.markdownTombstones.classifyBaseline(docPath, 'failed');
+            throw err;
+          } finally {
+            this.bridge.releaseRemoteFlushQuarantine([docPath]);
+          }
+          continue;
+        }
+        if (this.pendingRemoteMarkdownDeletes.has(docPath)) {
+          continue;
+        }
         // A local file that is present during authoritative startup reconcile is
         // stronger evidence than a legacy server tombstone. Clear the tombstone
         // so polluted server state converges back to the user's recovered file.
@@ -908,35 +930,68 @@ export class VaultSyncEngine implements SyncEngine {
 
   private queueRemoteMarkdownDelete(docPath: string): void {
     this.pendingRemoteMarkdownDeletes.add(docPath);
-    if (this.markdownDeleteGateState === 'startup-blocked') {
-      this.startupRemoteMarkdownDeletes.add(docPath);
-    }
-  }
-
-  private queueExistingRemoteMarkdownTombstones(): void {
-    for (const docPath of this.fileTombstones.keys()) {
-      this.queueRemoteMarkdownDelete(docPath);
-    }
   }
 
   private async openMarkdownDeleteGate(): Promise<void> {
-    const wasStartupBlocked = this.markdownDeleteGateState === 'startup-blocked';
     this.markdownDeleteGateState = 'open';
-    if (!wasStartupBlocked) {
-      this.queueExistingRemoteMarkdownTombstones();
+    for (const decision of this.markdownTombstones.getReplayDecisions()) {
+      this.queueRemoteMarkdownDelete(decision.path);
+    }
+    for (const docPath of this.fileTombstones.keys()) {
+      if (this.markdownTombstones.getDecision(docPath).kind === 'absent') {
+        this.queueRemoteMarkdownDelete(docPath);
+      }
     }
     await this.flushPendingRemoteMarkdownDeletes();
+  }
+
+  private recordMarkdownTombstoneTransaction(txn: Y.Transaction): void {
+    const tombMap = this.fileTombstones;
+    if (!mapChanged(txn, tombMap)) return;
+
+    const changes = changedMapKeys(txn, tombMap).map((path) => ({
+      path,
+      tombstone: tombMap.get(path),
+    }));
+    const origin = this.getTombstoneReceiptOrigin(txn.origin);
+    const provenance = this.getTombstoneReceiptProvenance(origin);
+    this.markdownTombstones.applyTransaction(changes, { origin, provenance });
+
+    const startupBaselinePaths = changes
+      .filter((change) => change.tombstone !== undefined)
+      .map((change) => this.markdownTombstones.getDecision(change.path))
+      .filter((decision) => decision.kind === 'startup-baseline' && decision.status === 'unclassified')
+      .map((decision) => decision.path);
+    if (startupBaselinePaths.length > 0 && this.bridge) {
+      this.bridge.quarantineRemoteFlushes(startupBaselinePaths);
+    }
+
+    const clearedPaths = changes.filter((change) => change.tombstone === undefined).map((change) => change.path);
+    if (clearedPaths.length > 0 && this.bridge) {
+      this.bridge.releaseRemoteFlushQuarantine(clearedPaths);
+    }
+  }
+
+  private getTombstoneReceiptOrigin(origin: unknown): TombstoneReceiptOrigin {
+    if (origin === 'remote') return 'remote';
+    if (origin === 'cache') return 'cache';
+    if (origin === 'self') return 'self';
+    return 'local';
+  }
+
+  private getTombstoneReceiptProvenance(origin: TombstoneReceiptOrigin): TombstoneReceiptProvenance {
+    if (origin === 'cache') return 'cache-startup';
+    if (this.markdownDeleteGateState === 'startup-blocked') return 'startup-remote';
+    if (this.markdownDeleteGateState === 'maintenance-blocked') {
+      return this.initialSyncComplete ? 'startup-maintenance' : 'reconnect-maintenance';
+    }
+    return 'open';
   }
 
   private async flushPendingRemoteMarkdownDeletes(): Promise<void> {
     const pending = [...this.pendingRemoteMarkdownDeletes];
     this.pendingRemoteMarkdownDeletes.clear();
     for (const docPath of pending) {
-      if (!this.mount?.readOnly && this.startupRemoteMarkdownDeletes.has(docPath)) {
-        this.startupRemoteMarkdownDeletes.delete(docPath);
-        continue;
-      }
-      this.startupRemoteMarkdownDeletes.delete(docPath);
       await this.applyRemoteMarkdownDelete(docPath);
     }
   }
@@ -951,6 +1006,7 @@ export class VaultSyncEngine implements SyncEngine {
   }
 
   private handleRemoteTransactionSideEffects(txn: Y.Transaction): void {
+    this.recordMarkdownTombstoneTransaction(txn);
     const changedDocIds = mapChanged(txn, this.docs) ? changedMapKeys(txn, this.docs) : [];
     this.bridge.handleRemoteTransaction(txn, this.docs, this.idToPath, changedDocIds);
 
@@ -960,11 +1016,13 @@ export class VaultSyncEngine implements SyncEngine {
     if (mapChanged(txn, tombMap)) {
       for (const docPath of changedMapKeys(txn, tombMap)) {
         if (tombMap.has(docPath)) {
-          if (this.markdownDeleteGateState === 'open') {
+          const decision = this.markdownTombstones.getDecision(docPath);
+          const replayable = decision.replayable;
+          if (this.markdownDeleteGateState === 'open' && replayable) {
             this.applyRemoteMarkdownDelete(docPath).catch((err) => {
               console.error(`[VaultSync] markdown delete side effect error for ${docPath}:`, err);
             });
-          } else {
+          } else if (replayable) {
             this.queueRemoteMarkdownDelete(docPath);
           }
         }
@@ -1052,27 +1110,23 @@ export class VaultSyncEngine implements SyncEngine {
       } else {
         await this.reconcile();
         await this.runBlobMaintenance('authoritative');
-        this.clearStartupTombstonesForPresentLocalFiles();
       }
       maintenanceComplete = true;
-    } finally {
-      if (maintenanceComplete) {
-        await this.openMarkdownDeleteGate();
-      }
+    } catch (err) {
+      this.markPendingStartupTombstonesFailed();
+      throw err;
+    }
+    if (maintenanceComplete) {
+      await this.openMarkdownDeleteGate();
     }
     this.bindAllOpenEditors();
     this.validateAllOpenBindings();
     this.notifyStatusChange();
   }
 
-  private clearStartupTombstonesForPresentLocalFiles(): void {
-    for (const docPath of [...this.fileTombstones.keys()]) {
-      if (this.pendingRemoteMarkdownDeletes.has(docPath) && !this.startupRemoteMarkdownDeletes.has(docPath)) continue;
-      if (this.plugin.app.vault.getAbstractFileByPath(this.toVaultPath(docPath))) {
-        this.fileTombstones.delete(docPath);
-        this.pendingRemoteMarkdownDeletes.delete(docPath);
-        this.startupRemoteMarkdownDeletes.delete(docPath);
-      }
+  private markPendingStartupTombstonesFailed(): void {
+    for (const docPath of this.markdownTombstones.getPendingPaths().baseline) {
+      this.markdownTombstones.classifyBaseline(docPath, 'failed');
     }
   }
 
