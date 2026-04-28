@@ -383,6 +383,10 @@ export class VaultSyncEngine implements SyncEngine {
       if (mapChanged(txn, tombMap)) {
         for (const docPath of changedMapKeys(txn, tombMap)) {
           if (tombMap.has(docPath)) {
+            if (!this.initialSyncComplete) {
+              // Startup-baseline tombstones are unclassified in PR A; never replay them destructively.
+              continue;
+            }
             this.editorBindings.unbindByPath(this.toVaultPath(docPath));
             this.bridge.notifyFileClosed(this.toVaultPath(docPath));
             this.bridge.deleteFile(docPath).catch((err) => {
@@ -946,7 +950,6 @@ export class VaultSyncEngine implements SyncEngine {
 
   private async completeInitialSync(): Promise<void> {
     this.awaitingInitialSync = false;
-    this.initialSyncComplete = true;
 
     if (this.mount?.readOnly) {
       await this.reconcileReadOnly();
@@ -955,6 +958,7 @@ export class VaultSyncEngine implements SyncEngine {
       await this.reconcile();
       await this.runBlobMaintenance('authoritative');
     }
+    this.initialSyncComplete = true;
     this.bindAllOpenEditors();
     this.validateAllOpenBindings();
     this.notifyStatusChange();
