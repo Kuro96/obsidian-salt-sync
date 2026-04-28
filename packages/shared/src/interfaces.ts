@@ -117,6 +117,9 @@ export interface FilesystemBridge {
 
   // 共享状态 -> 磁盘
   flushFile(path: string): Promise<void>;
+  quarantineRemoteFlushes(paths: Iterable<string>): void;
+  releaseRemoteFlushQuarantine(paths: Iterable<string>): void;
+  forceImportFromDisk(path: string): Promise<void>;
   suppressExpectedWrite(path: string, fingerprint: FileFingerprint): void;
 
   // 路由：根据文件路径判断归属哪个 room（主 vault 或共享目录挂载）

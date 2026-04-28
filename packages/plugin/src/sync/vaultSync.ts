@@ -50,6 +50,8 @@ export interface SyncStatus {
   pendingBlobLocalDeletions: number;
 }
 
+type MarkdownDeleteGateState = 'startup-blocked' | 'maintenance-blocked' | 'open';
+
 // ── Snapshot API response types ───────────────────────────────────────────────
 
 export type ManifestFileEntry =
@@ -104,6 +106,9 @@ export class VaultSyncEngine implements SyncEngine {
   private hasAuthenticated = false;
   private awaitingInitialSync = false;
   private initialSyncComplete = false;
+  private markdownDeleteGateState: MarkdownDeleteGateState = 'startup-blocked';
+  private readonly pendingRemoteMarkdownDeletes = new Set<string>();
+  private readonly startupRemoteMarkdownDeletes = new Set<string>();
   private blobMaintenancePaused = true;
   private clientStatus: ConnectionStatus = 'idle';
   private statusHandlers: Array<(status: SyncStatus) => void> = [];
@@ -112,6 +117,14 @@ export class VaultSyncEngine implements SyncEngine {
 
   /** Effective settings for this engine (may differ from plugin settings for mounts) */
   private readonly effectiveSettings: SaltSyncSettings;
+
+  private get remoteFileDeleteSideEffectsOpen(): boolean {
+    return this.markdownDeleteGateState === 'open';
+  }
+
+  private set remoteFileDeleteSideEffectsOpen(open: boolean) {
+    this.markdownDeleteGateState = open ? 'open' : 'startup-blocked';
+  }
 
   private get localCacheKey(): string {
     return `${this.effectiveSettings.serverUrl}::${this.effectiveSettings.vaultId}`;
@@ -350,6 +363,7 @@ export class VaultSyncEngine implements SyncEngine {
       `${this.effectiveSettings.serverUrl}::${this.effectiveSettings.vaultId}`,
       this.mount?.localPath,
     );
+    this.enterMarkdownStartupGate();
     this.blobSync.enterStartupGate();
     this.blobSync.onPendingDownloadsChange(() => this.notifyStatusChange());
     this.blobSync.onPendingUploadsChange(() => this.notifyStatusChange());
@@ -374,58 +388,7 @@ export class VaultSyncEngine implements SyncEngine {
     // Flush changed files / blobs to disk after remote updates
     this.ydoc.on('afterTransaction', (txn: Y.Transaction) => {
       if (txn.origin !== 'remote') return;
-
-      const changedDocIds = mapChanged(txn, this.docs) ? changedMapKeys(txn, this.docs) : [];
-      this.bridge.handleRemoteTransaction(txn, this.docs, this.idToPath, changedDocIds);
-
-      // 远端 markdown 删除 → 本地删除对应文件
-      const tombMap = this.fileTombstones;
-      if (mapChanged(txn, tombMap)) {
-        for (const docPath of changedMapKeys(txn, tombMap)) {
-          if (tombMap.has(docPath)) {
-            if (!this.initialSyncComplete) {
-              // Startup-baseline tombstones are unclassified in PR A; never replay them destructively.
-              continue;
-            }
-            this.editorBindings.unbindByPath(this.toVaultPath(docPath));
-            this.bridge.notifyFileClosed(this.toVaultPath(docPath));
-            this.bridge.deleteFile(docPath).catch((err) => {
-              console.error(`[VaultSync] deleteFile error for ${docPath}:`, err);
-            });
-          }
-        }
-      }
-
-      // 远端 markdown 重命名 → 本地同步路径变更
-      // rename 只改 pathToId/idToPath，不改 docs（Y.Text 内容不变），
-      // handleRemoteTransaction 检测不到，需要单独处理。
-      if (mapChanged(txn, this.pathToId)) {
-        for (const docPath of changedMapKeys(txn, this.pathToId)) {
-          const fileId = this.pathToId.get(docPath);
-          if (!fileId) {
-            // 路径从 pathToId 中移除：只有同一事务能证明它是单目标 rename 的源路径时，才清理本地旧路径。
-            if (!this.fileTombstones.has(docPath) && this.getUnambiguousRemoteRenameTarget(docPath, txn)) {
-              this.editorBindings.unbindByPath(this.toVaultPath(docPath));
-              this.bridge.notifyFileClosed(this.toVaultPath(docPath));
-              this.bridge.deleteFile(docPath).catch((err) => {
-                console.error(`[VaultSync] remote rename cleanup error for ${docPath}:`, err);
-              });
-            }
-          } else {
-            // 路径新增到 pathToId：如果 docs 有对应 Y.Text 且本地无该文件，
-            // 说明是 rename 的目标路径，物化到磁盘。
-            if (this.docs.get(fileId) && !this.plugin.app.vault.getAbstractFileByPath(this.toVaultPath(docPath))) {
-              this.bridge.flushFile(docPath).catch((err) => {
-                console.error(`[VaultSync] remote rename flush error for ${docPath}:`, err);
-              });
-            }
-          }
-        }
-      }
-
-      this.blobSync.handleRemoteBlobChanges(txn).catch((err) => {
-        console.error('[VaultSync] blobSync remote changes error:', err);
-      });
+      this.handleRemoteTransactionSideEffects(txn);
     });
 
     // Handle incoming server messages
@@ -638,7 +601,16 @@ export class VaultSyncEngine implements SyncEngine {
    */
   private async reconcileReadOnly(): Promise<void> {
     const paths: string[] = [];
-    for (const [docPath] of this.pathToId) paths.push(docPath);
+    for (const [docPath] of this.pathToId) {
+      if (this.fileTombstones.has(docPath)) {
+        this.queueRemoteMarkdownDelete(docPath);
+        continue;
+      }
+      paths.push(docPath);
+    }
+    for (const docPath of this.fileTombstones.keys()) {
+      this.queueRemoteMarkdownDelete(docPath);
+    }
     for (const docPath of paths) {
       await this.bridge.flushFile(docPath).catch((err) => {
         console.error(`[VaultSync] readOnly reconcile flushFile error for ${docPath}:`, err);
@@ -659,7 +631,16 @@ export class VaultSyncEngine implements SyncEngine {
       const docPath = this.toDocPath(file.path);
       localDocPaths.add(docPath);
       this.knownLocalMarkdownPaths.add(docPath);
+      if (this.fileTombstones.has(docPath) && this.pendingRemoteMarkdownDeletes.has(docPath)) {
+        continue;
+      }
       this.getOrCreateYText(docPath);
+      if (this.fileTombstones.has(docPath)) {
+        // A local file that is present during authoritative startup reconcile is
+        // stronger evidence than a legacy server tombstone. Clear the tombstone
+        // so polluted server state converges back to the user's recovered file.
+        this.fileTombstones.delete(docPath);
+      }
       this.bridge.markDirty(file.path); // markDirty takes vaultPath, bridge converts
     }
     await this.bridge.drain();
@@ -917,6 +898,111 @@ export class VaultSyncEngine implements SyncEngine {
     return targets.length === 1 ? targets[0] : null;
   }
 
+  private enterMarkdownStartupGate(): void {
+    this.markdownDeleteGateState = 'startup-blocked';
+  }
+
+  private enterMarkdownMaintenanceGate(): void {
+    this.markdownDeleteGateState = 'maintenance-blocked';
+  }
+
+  private queueRemoteMarkdownDelete(docPath: string): void {
+    this.pendingRemoteMarkdownDeletes.add(docPath);
+    if (this.markdownDeleteGateState === 'startup-blocked') {
+      this.startupRemoteMarkdownDeletes.add(docPath);
+    }
+  }
+
+  private queueExistingRemoteMarkdownTombstones(): void {
+    for (const docPath of this.fileTombstones.keys()) {
+      this.queueRemoteMarkdownDelete(docPath);
+    }
+  }
+
+  private async openMarkdownDeleteGate(): Promise<void> {
+    const wasStartupBlocked = this.markdownDeleteGateState === 'startup-blocked';
+    this.markdownDeleteGateState = 'open';
+    if (!wasStartupBlocked) {
+      this.queueExistingRemoteMarkdownTombstones();
+    }
+    await this.flushPendingRemoteMarkdownDeletes();
+  }
+
+  private async flushPendingRemoteMarkdownDeletes(): Promise<void> {
+    const pending = [...this.pendingRemoteMarkdownDeletes];
+    this.pendingRemoteMarkdownDeletes.clear();
+    for (const docPath of pending) {
+      if (!this.mount?.readOnly && this.startupRemoteMarkdownDeletes.has(docPath)) {
+        this.startupRemoteMarkdownDeletes.delete(docPath);
+        continue;
+      }
+      this.startupRemoteMarkdownDeletes.delete(docPath);
+      await this.applyRemoteMarkdownDelete(docPath);
+    }
+  }
+
+  private async applyRemoteMarkdownDelete(docPath: string): Promise<void> {
+    if (!this.fileTombstones.has(docPath)) return;
+    this.editorBindings?.unbindByPath(this.toVaultPath(docPath));
+    this.bridge.notifyFileClosed(this.toVaultPath(docPath));
+    await this.bridge.deleteFile(docPath).catch((err) => {
+      console.error(`[VaultSync] deleteFile error for ${docPath}:`, err);
+    });
+  }
+
+  private handleRemoteTransactionSideEffects(txn: Y.Transaction): void {
+    const changedDocIds = mapChanged(txn, this.docs) ? changedMapKeys(txn, this.docs) : [];
+    this.bridge.handleRemoteTransaction(txn, this.docs, this.idToPath, changedDocIds);
+
+    // Remote markdown tombstones are replayed once startup/maintenance can
+    // safely distinguish stale server pollution from authoritative deletes.
+    const tombMap = this.fileTombstones;
+    if (mapChanged(txn, tombMap)) {
+      for (const docPath of changedMapKeys(txn, tombMap)) {
+        if (tombMap.has(docPath)) {
+          if (this.markdownDeleteGateState === 'open') {
+            this.applyRemoteMarkdownDelete(docPath).catch((err) => {
+              console.error(`[VaultSync] markdown delete side effect error for ${docPath}:`, err);
+            });
+          } else {
+            this.queueRemoteMarkdownDelete(docPath);
+          }
+        }
+      }
+    }
+
+    // 远端 markdown 重命名 → 本地同步路径变更
+    // rename 只改 pathToId/idToPath，不改 docs（Y.Text 内容不变），
+    // handleRemoteTransaction 检测不到，需要单独处理。
+    if (mapChanged(txn, this.pathToId)) {
+      for (const docPath of changedMapKeys(txn, this.pathToId)) {
+        const fileId = this.pathToId.get(docPath);
+        if (!fileId) {
+          // 路径从 pathToId 中移除：只有同一事务能证明它是单目标 rename 的源路径时，才清理本地旧路径。
+          if (!this.fileTombstones.has(docPath) && this.getUnambiguousRemoteRenameTarget(docPath, txn)) {
+            this.editorBindings.unbindByPath(this.toVaultPath(docPath));
+            this.bridge.notifyFileClosed(this.toVaultPath(docPath));
+            this.bridge.deleteFile(docPath).catch((err) => {
+              console.error(`[VaultSync] remote rename cleanup error for ${docPath}:`, err);
+            });
+          }
+        } else {
+          // 路径新增到 pathToId：如果 docs 有对应 Y.Text 且本地无该文件，
+          // 说明是 rename 的目标路径，物化到磁盘。
+          if (this.docs.get(fileId) && !this.plugin.app.vault.getAbstractFileByPath(this.toVaultPath(docPath))) {
+            this.bridge.flushFile(docPath).catch((err) => {
+              console.error(`[VaultSync] remote rename flush error for ${docPath}:`, err);
+            });
+          }
+        }
+      }
+    }
+
+    this.blobSync.handleRemoteBlobChanges(txn).catch((err) => {
+      console.error('[VaultSync] blobSync remote changes error:', err);
+    });
+  }
+
   private getOpenMarkdownViews(): MarkdownView[] {
     const leaves = this.plugin.app.workspace.getLeavesOfType('markdown') as unknown as Array<{ view: MarkdownView }>;
     return leaves.map((leaf) => leaf.view).filter((view): view is MarkdownView => !!view && !!view.file);
@@ -937,8 +1023,13 @@ export class VaultSyncEngine implements SyncEngine {
     const sv = Y.encodeStateVector(this.ydoc);
     await this.client.send({ type: 'sync_state_vector', sv });
     if (this.hasAuthenticated) {
-      await this.reconcile();
-      await this.runBlobMaintenance(this.mount?.readOnly ? 'conservative' : 'authoritative');
+      this.enterMarkdownMaintenanceGate();
+      try {
+        await this.reconcile();
+        await this.runBlobMaintenance(this.mount?.readOnly ? 'conservative' : 'authoritative');
+      } finally {
+        await this.openMarkdownDeleteGate();
+      }
       this.bindAllOpenEditors();
       this.validateAllOpenBindings();
     } else {
@@ -950,18 +1041,39 @@ export class VaultSyncEngine implements SyncEngine {
 
   private async completeInitialSync(): Promise<void> {
     this.awaitingInitialSync = false;
-
-    if (this.mount?.readOnly) {
-      await this.reconcileReadOnly();
-      await this.runBlobMaintenance('conservative');
-    } else {
-      await this.reconcile();
-      await this.runBlobMaintenance('authoritative');
-    }
     this.initialSyncComplete = true;
+    this.enterMarkdownMaintenanceGate();
+
+    let maintenanceComplete = false;
+    try {
+      if (this.mount?.readOnly) {
+        await this.reconcileReadOnly();
+        await this.runBlobMaintenance('conservative');
+      } else {
+        await this.reconcile();
+        await this.runBlobMaintenance('authoritative');
+        this.clearStartupTombstonesForPresentLocalFiles();
+      }
+      maintenanceComplete = true;
+    } finally {
+      if (maintenanceComplete) {
+        await this.openMarkdownDeleteGate();
+      }
+    }
     this.bindAllOpenEditors();
     this.validateAllOpenBindings();
     this.notifyStatusChange();
+  }
+
+  private clearStartupTombstonesForPresentLocalFiles(): void {
+    for (const docPath of [...this.fileTombstones.keys()]) {
+      if (this.pendingRemoteMarkdownDeletes.has(docPath) && !this.startupRemoteMarkdownDeletes.has(docPath)) continue;
+      if (this.plugin.app.vault.getAbstractFileByPath(this.toVaultPath(docPath))) {
+        this.fileTombstones.delete(docPath);
+        this.pendingRemoteMarkdownDeletes.delete(docPath);
+        this.startupRemoteMarkdownDeletes.delete(docPath);
+      }
+    }
   }
 
   private async runBlobMaintenance(mode: 'authoritative' | 'conservative'): Promise<void> {

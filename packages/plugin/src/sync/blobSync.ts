@@ -174,11 +174,19 @@ export class BlobSync {
     if (mapChanged(txn, tombMap)) {
       for (const path of changedMapKeys(txn, tombMap)) {
         if (tombMap.has(path)) {
-          this.pendingRemoteDownloads.delete(path);
-          this.notifyPendingDownloadsChange();
-          this.pendingRemoteDeletes.add(path);
-          this.notifyPendingRemoteDeletesChange();
-          this.persistRuntimeState();
+          const removedPendingDownload = this.pendingRemoteDownloads.delete(path);
+          if (removedPendingDownload) {
+            this.notifyPendingDownloadsChange();
+            this.persistRuntimeState();
+          }
+          // Tombstones received during the startup gate may be legacy server
+          // pollution. Keep them in the shared model but do not queue local
+          // delete side effects until future changes arrive after startup.
+          if (this.gateState !== 'startup-blocked') {
+            this.pendingRemoteDeletes.add(path);
+            this.notifyPendingRemoteDeletesChange();
+            this.persistRuntimeState();
+          }
         }
       }
     }
@@ -224,6 +232,7 @@ export class BlobSync {
     // 本地删除先于远端 apply 落地，避免远端 pathToBlob 到达时把刚删除的 blob 拉回来。
     this.flushPendingLocalDeletions();
     await this.flushPendingLocalUpserts();
+    this.queueExistingRemoteTombstones();
     await this.flushPendingRemoteChanges();
     await this.flushPersistChain();
   }
@@ -518,6 +527,11 @@ export class BlobSync {
 
       const localHash = await this.getLocalBlobHash(docPath, file);
       this.knownLocalPaths.add(docPath);
+      if (this.blobTombstones.has(docPath) && mode === 'authoritative') {
+        if (this.pendingRemoteDeletes.has(docPath)) continue;
+        await this.handleLocalBlobChange(docPath);
+        continue;
+      }
       if (ref.hash !== localHash && mode === 'authoritative') {
         await this.handleLocalBlobChange(docPath);
       }
@@ -585,6 +599,19 @@ export class BlobSync {
       console.error('[BlobSync] remote change error:', err);
     }
     this.persistRuntimeState();
+  }
+
+  private queueExistingRemoteTombstones(): void {
+    let changed = false;
+    for (const docPath of this.blobTombstones.keys()) {
+      if (this.pendingRemoteDeletes.has(docPath)) continue;
+      this.pendingRemoteDeletes.add(docPath);
+      changed = true;
+    }
+    if (changed) {
+      this.notifyPendingRemoteDeletesChange();
+      this.persistRuntimeState();
+    }
   }
 
   private flushPendingLocalDeletions(): void {
@@ -665,6 +692,15 @@ export class BlobSync {
 
       const existingRef = this.pathToBlob.get(path);
       if (existingRef?.hash === hash) {
+        if (this.blobTombstones.has(path)) {
+          if (this.pendingRemoteDeletes.has(path)) {
+            completed = true;
+            return;
+          }
+          this.ydoc.transact(() => {
+            this.blobTombstones.delete(path);
+          }, 'local-blob');
+        }
         completed = true;
         return;
       }
@@ -674,6 +710,11 @@ export class BlobSync {
       // 上传期间文件可能已被删除；再次确认本地状态，避免把刚被删除的 blob 复活
       // （或把 tombstone 清掉）。Phase 9 Issue A 的第二道防线。
       if (!this.vault.getAbstractFileByPath(this.toVaultPath(path))) {
+        completed = true;
+        return;
+      }
+
+      if (this.blobTombstones.has(path) && this.pendingRemoteDeletes.has(path)) {
         completed = true;
         return;
       }

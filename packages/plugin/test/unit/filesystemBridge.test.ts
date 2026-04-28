@@ -387,4 +387,165 @@ describe('ObsidianFilesystemBridge', () => {
     await new Promise((r) => setTimeout(r, 600));
     expect(await vault.read(vault.getFileByPath('note.md')!)).toBe('local-disk-edit');
   });
+
+  it('quarantines remote flush side effects for selected closed doc paths until release', async () => {
+    const { bridge, vault, ytextByPath, ydoc } = setup();
+    const ytext = ydoc.getText('f');
+    ytext.insert(0, 'local-recovered');
+    ytextByPath.set('startup.md', ytext);
+    vault.seedText('startup.md', 'local-recovered');
+    const docs = new Map<string, Y.Text>([['file-1', ytext]]);
+    const idToPath = new Map<string, string>([['file-1', 'startup.md']]);
+
+    let remoteTxn: Y.Transaction | null = null;
+    ydoc.on('afterTransaction', (txn) => {
+      if (txn.origin === 'remote') remoteTxn = txn;
+    });
+
+    bridge.quarantineRemoteFlushes(['startup.md']);
+    ydoc.transact(() => {
+      ytext.delete(0, ytext.length);
+      ytext.insert(0, 'stale-remote');
+    }, 'remote');
+
+    bridge.handleRemoteTransaction(remoteTxn!, docs, idToPath, ['file-1']);
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(await vault.read(vault.getFileByPath('startup.md')!)).toBe('local-recovered');
+
+    bridge.releaseRemoteFlushQuarantine(['startup.md']);
+    ydoc.transact(() => {
+      ytext.insert(ytext.length, '-future');
+    }, 'remote');
+    bridge.handleRemoteTransaction(remoteTxn!, docs, idToPath, ['file-1']);
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(await vault.read(vault.getFileByPath('startup.md')!)).toBe('stale-remote-future');
+  });
+
+  it('does not replay a closed-file flush that was already queued before quarantine', async () => {
+    const { bridge, vault, ytextByPath, ydoc } = setup();
+    const ytext = ydoc.getText('f');
+    ytext.insert(0, 'original');
+    ytextByPath.set('queued.md', ytext);
+    vault.seedText('queued.md', 'original');
+    const docs = new Map<string, Y.Text>([['file-1', ytext]]);
+    const idToPath = new Map<string, string>([['file-1', 'queued.md']]);
+
+    const originalModify = vault.modify.bind(vault);
+    let releaseFirstModify!: () => void;
+    const firstModifyStarted = new Promise<void>((resolve) => {
+      vault.modify = async (file, content) => {
+        resolve();
+        await new Promise<void>((release) => {
+          releaseFirstModify = release;
+        });
+        await originalModify(file, content);
+      };
+    });
+
+    ytext.delete(0, ytext.length);
+    ytext.insert(0, 'first-remote');
+    const firstFlush = bridge.flushFile('queued.md');
+    await firstModifyStarted;
+
+    let remoteTxn: Y.Transaction | null = null;
+    ydoc.on('afterTransaction', (txn) => {
+      if (txn.origin === 'remote') remoteTxn = txn;
+    });
+    ydoc.transact(() => {
+      ytext.delete(0, ytext.length);
+      ytext.insert(0, 'queued-stale-remote');
+    }, 'remote');
+    bridge.handleRemoteTransaction(remoteTxn!, docs, idToPath, ['file-1']);
+
+    bridge.quarantineRemoteFlushes(['queued.md']);
+    releaseFirstModify();
+    await firstFlush;
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(await vault.read(vault.getFileByPath('queued.md')!)).toBe('first-remote');
+  });
+
+  it('carries quarantine and write invalidation state across rename bookkeeping', async () => {
+    const { bridge, vault, ytextByPath, ydoc } = setup();
+    const ytext = ydoc.getText('f');
+    ytext.insert(0, 'local-recovered');
+    ytextByPath.set('new.md', ytext);
+    vault.seedText('new.md', 'local-recovered');
+    const docs = new Map<string, Y.Text>([['file-1', ytext]]);
+    const idToPath = new Map<string, string>([['file-1', 'new.md']]);
+
+    bridge.quarantineRemoteFlushes(['old.md']);
+    bridge.updatePathAfterRename('old.md', 'new.md');
+
+    let remoteTxn: Y.Transaction | null = null;
+    ydoc.on('afterTransaction', (txn) => {
+      if (txn.origin === 'remote') remoteTxn = txn;
+    });
+    ydoc.transact(() => {
+      ytext.delete(0, ytext.length);
+      ytext.insert(0, 'stale-remote-after-rename');
+    }, 'remote');
+    bridge.handleRemoteTransaction(remoteTxn!, docs, idToPath, ['file-1']);
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(await vault.read(vault.getFileByPath('new.md')!)).toBe('local-recovered');
+  });
+
+  it('force-imports disk content even when normal open-file policy would defer', async () => {
+    const ydoc = new Y.Doc();
+    const ytextByPath = new Map<string, Y.Text>();
+    const getYText = (docPath: string): Y.Text | null => ytextByPath.get(docPath) ?? null;
+    const vault = new MockVault();
+    const bridge = new ObsidianFilesystemBridge(
+      vault as unknown as Vault,
+      getYText,
+      ydoc,
+      'primary',
+      undefined,
+      undefined,
+      () => 'closed-only',
+      () => true,
+    );
+    const ytext = ydoc.getText('f');
+    ytext.insert(0, 'stale-remote');
+    ytextByPath.set('open.md', ytext);
+    vault.seedText('open.md', 'local-recovered');
+
+    bridge.notifyFileOpened('open.md');
+    bridge.markDirty('open.md');
+    await bridge.drain();
+    expect(ytext.toString()).toBe('stale-remote');
+
+    await bridge.forceImportFromDisk('open.md');
+
+    expect(ytext.toString()).toBe('local-recovered');
+  });
+
+  it('force-import invalidates pending open remote writes before quarantine release', async () => {
+    const { bridge, vault, ytextByPath, ydoc } = setup({
+      isBindingHealthy: () => false,
+    });
+    const ytext = ydoc.getText('f');
+    ytext.insert(0, 'original');
+    ytextByPath.set('open.md', ytext);
+    vault.seedText('open.md', 'original');
+
+    bridge.notifyFileOpened('open.md');
+    ydoc.transact(() => {
+      ytext.delete(0, ytext.length);
+      ytext.insert(0, 'stale-remote');
+    }, 'remote');
+
+    bridge.quarantineRemoteFlushes(['open.md']);
+    vault.seedText('open.md', 'local-recovered');
+    await bridge.forceImportFromDisk('open.md');
+    bridge.releaseRemoteFlushQuarantine(['open.md']);
+
+    await new Promise((r) => setTimeout(r, 250));
+
+    expect(ytext.toString()).toBe('local-recovered');
+    expect(await vault.read(vault.getFileByPath('open.md')!)).toBe('local-recovered');
+  });
 });
