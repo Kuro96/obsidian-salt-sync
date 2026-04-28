@@ -33,11 +33,13 @@ function internals(engine: VaultSyncEngine) {
   const self = engine as unknown as {
     ydoc: Y.Doc;
     knownLocalMarkdownPaths: Set<string>;
+    pendingLocalMarkdownDeletions: Set<string>;
   };
   const ydoc = self.ydoc;
   return {
     ydoc,
     knownLocalMarkdownPaths: self.knownLocalMarkdownPaths,
+    pendingLocalMarkdownDeletions: self.pendingLocalMarkdownDeletions,
     pathToId: ydoc.getMap('pathToId') as Y.Map<string>,
     idToPath: ydoc.getMap('idToPath') as Y.Map<string>,
     docs: ydoc.getMap('docs') as Y.Map<Y.Text>,
@@ -656,10 +658,23 @@ describe('VaultSyncEngine', () => {
       expect(typeof ts.deletedAt).toBe('string');
     });
 
-    it('is a no-op when path is unknown', () => {
+    it('records pending deletion when path is unknown', () => {
       const engine = new VaultSyncEngine(fakePlugin(), baseSettings(), null);
-      const { tombstones } = internals(engine);
+      const { pendingLocalMarkdownDeletions, tombstones } = internals(engine);
       engine.handleLocalFileDeletion('ghost.md');
+      expect(pendingLocalMarkdownDeletions.has('ghost.md')).toBe(true);
+      expect(tombstones.size).toBe(0);
+    });
+
+    it('does not record pending deletion for unknown path after markdown delete gate is open', () => {
+      const engine = new VaultSyncEngine(fakePlugin(), baseSettings(), null);
+      const self = engine as unknown as { remoteFileDeleteSideEffectsOpen: boolean };
+      const { pendingLocalMarkdownDeletions, tombstones } = internals(engine);
+
+      self.remoteFileDeleteSideEffectsOpen = true;
+      engine.handleLocalFileDeletion('unknown.md');
+
+      expect(pendingLocalMarkdownDeletions.has('unknown.md')).toBe(false);
       expect(tombstones.size).toBe(0);
     });
   });
@@ -859,6 +874,31 @@ describe('VaultSyncEngine', () => {
       expect(tombstones.has('note.md')).toBe(false);
       // pathToId entry preserved
       expect(pathToId.get('note.md')).toBe(fid);
+    });
+
+    it('converts startup pending deletion to tombstone before materializing remote markdown', async () => {
+      const flushed: string[] = [];
+      const engine = setupForReconcile([], flushed);
+      const { ydoc, pathToId, idToPath, docs, tombstones } = internals(engine);
+
+      engine.handleLocalFileDeletion('deleted-before-baseline.md');
+
+      const fid = 'file-late-remote';
+      const text = new Y.Text();
+      text.insert(0, 'remote baseline');
+      ydoc.transact(() => {
+        pathToId.set('deleted-before-baseline.md', fid);
+        idToPath.set(fid, 'deleted-before-baseline.md');
+        docs.set(fid, text);
+      }, 'remote');
+
+      await engine.reconcile();
+
+      expect(tombstones.has('deleted-before-baseline.md')).toBe(true);
+      expect(pathToId.has('deleted-before-baseline.md')).toBe(false);
+      expect(idToPath.has(fid)).toBe(false);
+      expect(docs.has(fid)).toBe(false);
+      expect(flushed).not.toContain('deleted-before-baseline.md');
     });
 
     it('does not flush files that already have tombstones', async () => {
