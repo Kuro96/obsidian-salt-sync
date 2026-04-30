@@ -919,6 +919,42 @@ describe('VaultSyncEngine', () => {
       expect(flushed).not.toContain('deleted.md');
     });
 
+    it('read-only reconcile clears pending local markdown deletions', async () => {
+      const flushed: string[] = [];
+      const engine = setupReadOnlyForReconcile(flushed);
+      const { pendingLocalMarkdownDeletions } = internals(engine);
+
+      // Artificially add a pending deletion (shouldn't happen in practice for read-only)
+      pendingLocalMarkdownDeletions.add('leaked.md');
+
+      await engine.reconcile();
+
+      expect(pendingLocalMarkdownDeletions.size).toBe(0);
+    });
+
+    it('gcStaleTombstones removes entries older than TTL', async () => {
+      const engine = setupForReconcile([]);
+      const { ydoc, tombstones } = internals(engine);
+      const blobTombstones = ydoc.getMap('blobTombstones') as Y.Map<{ hash: string; deletedAt: string }>;
+
+      // Create tombstones: one old (8 days), one recent (1 hour)
+      const oldDate = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+      const recentDate = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+      ydoc.transact(() => {
+        tombstones.set('old.md', { deletedAt: oldDate });
+        tombstones.set('recent.md', { deletedAt: recentDate });
+        blobTombstones.set('old.png', { hash: 'abc', deletedAt: oldDate });
+        blobTombstones.set('recent.png', { hash: 'def', deletedAt: recentDate });
+      });
+
+      await engine.reconcile();
+
+      expect(tombstones.has('old.md')).toBe(false);
+      expect(tombstones.has('recent.md')).toBe(true);
+      expect(blobTombstones.has('old.png')).toBe(false);
+      expect(blobTombstones.has('recent.png')).toBe(true);
+    });
+
     it('read-only reconcile skips flushing paths present in fileTombstones', async () => {
       const flushed: string[] = [];
       const engine = setupReadOnlyForReconcile(flushed);
@@ -1172,6 +1208,65 @@ describe('VaultSyncEngine', () => {
       applyRemoteTombstone(engine, 'live.md');
 
       expect(self.bridge.deleteFile).toHaveBeenCalledWith('live.md');
+      await engine.stop();
+    });
+
+    it('does not flush pending local markdown deletions while gate is blocked', async () => {
+      const { engine, self } = await setupStartedEngine();
+      const { ydoc, pathToId, idToPath, docs, tombstones } = internals(engine);
+
+      // User deletes a file before reconcile — no fileId yet, so it goes to pending
+      engine.handleLocalFileDeletion('pending-del.md');
+      expect(internals(engine).pendingLocalMarkdownDeletions.has('pending-del.md')).toBe(true);
+
+      // Remote transaction arrives and creates the fileId for this path
+      await self.handleAuthOk();
+      const fid = 'file-pending';
+      const text = new Y.Text();
+      text.insert(0, 'remote content');
+      ydoc.transact(() => {
+        pathToId.set('pending-del.md', fid);
+        idToPath.set(fid, 'pending-del.md');
+        docs.set(fid, text);
+      }, 'remote');
+
+      // The pending deletion must NOT have been flushed by the remote transaction
+      // (gate is startup-blocked → maintenance-blocked, not open)
+      expect(tombstones.has('pending-del.md')).toBe(false);
+      expect(internals(engine).pendingLocalMarkdownDeletions.has('pending-del.md')).toBe(true);
+
+      await engine.stop();
+    });
+
+    it('flushes pending local markdown deletions when gate is open', async () => {
+      const { engine, self } = await setupStartedEngine();
+      const { ydoc, pathToId, idToPath, docs, tombstones, pendingLocalMarkdownDeletions } = internals(engine);
+
+      // Add a pending deletion while gate is startup-blocked (before reconcile)
+      engine.handleLocalFileDeletion('pending-flush.md');
+      expect(pendingLocalMarkdownDeletions.has('pending-flush.md')).toBe(true);
+
+      // Complete initial sync — reconcile will try to flush but 'pending-flush.md'
+      // still has no fileId so it stays in pending
+      await self.handleAuthOk();
+      await self.completeInitialSync();
+      // Gate is now open; pending is still there (no fileId to write tombstone for)
+      expect(pendingLocalMarkdownDeletions.has('pending-flush.md')).toBe(true);
+
+      // A remote transaction arrives and provides the fileId
+      const fid = 'file-late';
+      const text = new Y.Text();
+      text.insert(0, 'content');
+      ydoc.transact(() => {
+        pathToId.set('pending-flush.md', fid);
+        idToPath.set(fid, 'pending-flush.md');
+        docs.set(fid, text);
+      }, 'remote');
+
+      // Gate is open, so the pending deletion should now be flushed
+      expect(tombstones.has('pending-flush.md')).toBe(true);
+      expect(pathToId.has('pending-flush.md')).toBe(false);
+
       await engine.stop();
     });
 
@@ -1489,6 +1584,78 @@ describe('VaultSyncEngine', () => {
       expect(tombstones.has('old.md')).toBe(true);
       expect(deleted).toEqual(['old.md']);
       expect(flushed).toEqual(['restored.md']);
+    });
+  });
+
+  describe('markdown pending persistence', () => {
+    it('pending local markdown deletions survive engine restart via markdownPendingStore', async () => {
+      const plugin = new MockPlugin();
+      const engine = new VaultSyncEngine(plugin as unknown as Plugin, baseSettings(), null);
+      const { pendingLocalMarkdownDeletions } = internals(engine);
+      const self = engine as unknown as {
+        markdownPendingStore: {
+          load: () => Promise<{ pendingLocalDeletions: string[] } | null>;
+          save: (_key: string, state: { pendingLocalDeletions: string[] }) => Promise<void>;
+        };
+        restoreMarkdownPending: () => Promise<void>;
+      };
+
+      // Simulate prior session: store has a pending deletion
+      self.markdownPendingStore = {
+        load: async () => ({ pendingLocalDeletions: ['orphan.md'], vaultId: 'test', updatedAt: '' }),
+        save: vi.fn(async () => {}),
+      };
+
+      await self.restoreMarkdownPending();
+
+      expect(pendingLocalMarkdownDeletions.has('orphan.md')).toBe(true);
+    });
+
+    it('restored pending skips paths that exist on disk', async () => {
+      const plugin = new MockPlugin();
+      plugin.app.vault.seedText('recovered.md', 'back');
+      const engine = new VaultSyncEngine(plugin as unknown as Plugin, baseSettings(), null);
+      const { pendingLocalMarkdownDeletions } = internals(engine);
+      const self = engine as unknown as {
+        markdownPendingStore: {
+          load: () => Promise<{ pendingLocalDeletions: string[] } | null>;
+          save: (_key: string, state: { pendingLocalDeletions: string[] }) => Promise<void>;
+        };
+        restoreMarkdownPending: () => Promise<void>;
+      };
+
+      self.markdownPendingStore = {
+        load: async () => ({ pendingLocalDeletions: ['recovered.md'], vaultId: 'test', updatedAt: '' }),
+        save: vi.fn(async () => {}),
+      };
+
+      await self.restoreMarkdownPending();
+
+      expect(pendingLocalMarkdownDeletions.has('recovered.md')).toBe(false);
+    });
+
+    it('restored pending skips paths with existing tombstones', async () => {
+      const plugin = new MockPlugin();
+      const engine = new VaultSyncEngine(plugin as unknown as Plugin, baseSettings(), null);
+      const { tombstones, pendingLocalMarkdownDeletions } = internals(engine);
+      tombstones.set('already-dead.md', { deletedAt: new Date().toISOString() });
+
+      const self = engine as unknown as {
+        markdownPendingStore: {
+          load: () => Promise<{ pendingLocalDeletions: string[] } | null>;
+          save: (_key: string, state: { pendingLocalDeletions: string[] }) => Promise<void>;
+        };
+        restoreMarkdownPending: () => Promise<void>;
+      };
+
+      self.markdownPendingStore = {
+        load: async () => ({ pendingLocalDeletions: ['already-dead.md'], vaultId: 'test', updatedAt: '' }),
+        save: vi.fn(async () => {}),
+      };
+
+      await self.restoreMarkdownPending();
+
+      expect(pendingLocalMarkdownDeletions.has('already-dead.md')).toBe(false);
     });
   });
 });

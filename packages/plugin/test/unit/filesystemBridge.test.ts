@@ -548,4 +548,62 @@ describe('ObsidianFilesystemBridge', () => {
     expect(ytext.toString()).toBe('local-recovered');
     expect(await vault.read(vault.getFileByPath('open.md')!)).toBe('local-recovered');
   });
+
+  it('doFlushFile skips paths marked as deleted by isDeletedPath', async () => {
+    const ydoc = new Y.Doc();
+    const ytextByPath = new Map<string, Y.Text>();
+    const getYText = (docPath: string): Y.Text | null => ytextByPath.get(docPath) ?? null;
+    const vault = new MockVault();
+    const deletedPaths = new Set<string>();
+    const bridge = new ObsidianFilesystemBridge(
+      vault as unknown as Vault,
+      getYText,
+      ydoc,
+      'primary',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      (docPath) => deletedPaths.has(docPath),
+    );
+    const ytext = ydoc.getText('f');
+    ytext.insert(0, 'should-not-write');
+    ytextByPath.set('deleted.md', ytext);
+
+    // Mark as deleted, then try to flush
+    deletedPaths.add('deleted.md');
+    await bridge.flushFile('deleted.md');
+
+    // File must NOT be created
+    expect(vault.getFileByPath('deleted.md')).toBeNull();
+  });
+
+  it('doFlushFile creates file when isDeletedPath returns false', async () => {
+    const ydoc = new Y.Doc();
+    const ytextByPath = new Map<string, Y.Text>();
+    const getYText = (docPath: string): Y.Text | null => ytextByPath.get(docPath) ?? null;
+    const vault = new MockVault();
+    const bridge = new ObsidianFilesystemBridge(
+      vault as unknown as Vault,
+      getYText,
+      ydoc,
+      'primary',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      () => false,
+    );
+    const ytext = ydoc.getText('f');
+    ytext.insert(0, 'content');
+    ytextByPath.set('alive.md', ytext);
+
+    await bridge.flushFile('alive.md');
+
+    const file = vault.getFileByPath('alive.md')!;
+    expect(file).not.toBeNull();
+    expect(await vault.read(file)).toBe('content');
+  });
 });

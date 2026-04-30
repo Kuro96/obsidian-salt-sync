@@ -59,6 +59,8 @@ export class ObsidianFilesystemBridge implements FilesystemBridge {
     private readonly isBindingHealthy: (vaultPath: string) => boolean = () => true,
     /** Optional: called when a file is found missing on disk during importFromDisk */
     private readonly onExternalDeletion?: (docPath: string) => void,
+    /** Optional: returns true if the docPath has been tombstoned and must not be recreated */
+    private readonly isDeletedPath?: (docPath: string) => boolean,
   ) {}
 
   // ── FilesystemBridge interface ────────────────────────────────────────────
@@ -471,6 +473,7 @@ export class ObsidianFilesystemBridge implements FilesystemBridge {
   private async doFlushFile(docPath: string, generation: number): Promise<void> {
     if (this.remoteFlushQuarantine.has(docPath)) return;
     if (generation !== this.currentWriteGeneration(docPath)) return;
+    if (this.isDeletedPath?.(docPath)) return;
 
     const ytext = this.getYText(docPath);
     if (!ytext) return;

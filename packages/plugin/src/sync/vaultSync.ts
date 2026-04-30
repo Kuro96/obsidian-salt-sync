@@ -13,7 +13,7 @@ import type {
   ConnectionStatus,
 } from '@salt-sync/shared';
 import type { SaltSyncSettings } from '../settings';
-import { IndexedDbBlobRuntimeStateStore, IndexedDbLocalCache } from '../storage/indexedDbStore';
+import { IndexedDbBlobRuntimeStateStore, IndexedDbLocalCache, IndexedDbMarkdownPendingStore } from '../storage/indexedDbStore';
 import { RoomClient } from './roomClient';
 import { EditorBindingManager } from './editorBinding';
 import { ObsidianFilesystemBridge } from './filesystemBridge';
@@ -84,6 +84,7 @@ export class VaultSyncEngine implements SyncEngine {
   private readonly client = new RoomClient();
   private readonly cache = new IndexedDbLocalCache();
   private readonly blobRuntimeStateStore = new IndexedDbBlobRuntimeStateStore();
+  private readonly markdownPendingStore = new IndexedDbMarkdownPendingStore();
   private readonly awareness = new Awareness(this.ydoc);
   private editorBindings!: EditorBindingManager;
   private bridge!: ObsidianFilesystemBridge;
@@ -351,6 +352,7 @@ export class VaultSyncEngine implements SyncEngine {
       undefined, // getExternalEditPolicy — use default ('always')
       (vaultPath) => this.editorBindings.isHealthyBinding(vaultPath),
       (docPath) => this.handleExternalMarkdownDeletion(docPath),
+      (docPath) => this.fileTombstones.has(docPath),
     );
 
     this.blobSync = new BlobSync(
@@ -397,6 +399,7 @@ export class VaultSyncEngine implements SyncEngine {
     if (cached) {
       Y.applyUpdate(this.ydoc, cached.ydocUpdate, 'cache');
     }
+    await this.restoreMarkdownPending();
 
     // Handle incoming server messages
     this.client.onMessage(async (msg) => {
@@ -625,6 +628,10 @@ export class VaultSyncEngine implements SyncEngine {
         console.error(`[VaultSync] readOnly reconcile flushFile error for ${docPath}:`, err);
       });
     }
+    // Read-only mounts should never accumulate local deletion pending.
+    // Defensive clear in case any leaked in through code paths that don't
+    // check readOnly before calling handleLocalFileDeletion.
+    this.pendingLocalMarkdownDeletions.clear();
     console.log(`[VaultSync] readOnly reconcile — ${paths.length} files`);
   }
 
@@ -690,7 +697,35 @@ export class VaultSyncEngine implements SyncEngine {
       if (!this.knownLocalMarkdownPaths.has(docPath)) continue;
       this.handleLocalFileDeletion(docPath);
     }
+    this.gcStaleTombstones();
     console.log(`[VaultSync] reconcile — ${files.length} files (${this.mount?.localPath ?? 'primary'})`);
+  }
+
+  /**
+   * Remove tombstones older than `maxAgeMs` (default 7 days).
+   * Once a tombstone has been synced to all devices it serves no further
+   * purpose; keeping it around inflates the Y.Doc and slows down sync.
+   */
+  private gcStaleTombstones(maxAgeMs: number = 7 * 24 * 60 * 60 * 1000): void {
+    const now = Date.now();
+    const mdGc: string[] = [];
+    for (const [docPath, tombstone] of this.fileTombstones) {
+      if (now - new Date(tombstone.deletedAt).getTime() > maxAgeMs) {
+        mdGc.push(docPath);
+      }
+    }
+    const blobGc: string[] = [];
+    for (const [docPath, tombstone] of this.blobTombstones) {
+      if (now - new Date(tombstone.deletedAt).getTime() > maxAgeMs) {
+        blobGc.push(docPath);
+      }
+    }
+    if (mdGc.length === 0 && blobGc.length === 0) return;
+    this.ydoc.transact(() => {
+      for (const p of mdGc) this.fileTombstones.delete(p);
+      for (const p of blobGc) this.blobTombstones.delete(p);
+    }, 'gc');
+    console.log(`[VaultSync] GC'd ${mdGc.length} markdown + ${blobGc.length} blob stale tombstones`);
   }
 
   async handleLocalFileChange(vaultPath: string): Promise<void> {
@@ -744,6 +779,7 @@ export class VaultSyncEngine implements SyncEngine {
     if (!fileId) {
       if (this.markdownDeleteGateState !== 'open' && !this.fileTombstones.has(docPath)) {
         this.pendingLocalMarkdownDeletions.add(docPath);
+        this.scheduleCacheSave();
       }
       return;
     }
@@ -929,6 +965,29 @@ export class VaultSyncEngine implements SyncEngine {
       ydocUpdate: update,
       updatedAt: new Date().toISOString(),
     });
+    await this.persistMarkdownPending();
+  }
+
+  private async persistMarkdownPending(): Promise<void> {
+    await this.markdownPendingStore.save(this.localCacheKey, {
+      vaultId: this.localCacheKey,
+      pendingLocalDeletions: [...this.pendingLocalMarkdownDeletions],
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  private async restoreMarkdownPending(): Promise<void> {
+    const saved = await this.markdownPendingStore.load(this.localCacheKey);
+    if (!saved) return;
+
+    for (const docPath of saved.pendingLocalDeletions) {
+      if (this.pendingLocalMarkdownDeletions.has(docPath)) continue;
+      // File has reappeared on disk → user likely undid the delete
+      if (this.plugin.app.vault.getAbstractFileByPath(this.toVaultPath(docPath))) continue;
+      // Tombstone already written → no need to keep pending
+      if (this.fileTombstones.has(docPath)) continue;
+      this.pendingLocalMarkdownDeletions.add(docPath);
+    }
   }
 
   private getUnambiguousRemoteRenameTarget(removedDocPath: string, txn: Y.Transaction): string | null {
@@ -1005,7 +1064,11 @@ export class VaultSyncEngine implements SyncEngine {
     if (origin === 'cache') return 'cache-startup';
     if (this.markdownDeleteGateState === 'startup-blocked') return 'startup-remote';
     if (this.markdownDeleteGateState === 'maintenance-blocked') {
-      return this.initialSyncComplete ? 'startup-maintenance' : 'reconnect-maintenance';
+      // Both startup and reconnect maintenance set initialSyncComplete=true
+      // before entering maintenance-blocked, so we can't reliably distinguish
+      // them here. Both provenances are treated identically by
+      // MarkdownTombstoneState (as live-delete), so this is cosmetic only.
+      return this.initialSyncComplete ? 'reconnect-maintenance' : 'startup-maintenance';
     }
     return 'open';
   }
@@ -1029,7 +1092,13 @@ export class VaultSyncEngine implements SyncEngine {
 
   private handleRemoteTransactionSideEffects(txn: Y.Transaction): void {
     this.recordMarkdownTombstoneTransaction(txn);
-    this.flushPendingLocalMarkdownDeletions(new Set());
+    // Only flush pending local deletions when the gate is fully open.
+    // During startup/maintenance the authoritative flush happens in reconcile()
+    // with a proper localDocPaths set — flushing here with an empty set would
+    // convert every pending path into a tombstone prematurely.
+    if (this.markdownDeleteGateState === 'open') {
+      this.flushPendingLocalMarkdownDeletions(new Set());
+    }
     const changedDocIds = mapChanged(txn, this.docs) ? changedMapKeys(txn, this.docs) : [];
     this.bridge.handleRemoteTransaction(txn, this.docs, this.idToPath, changedDocIds);
 
