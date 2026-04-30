@@ -142,6 +142,33 @@ describe('VaultRoom', () => {
     expect(diffs[0].update.length).toBeGreaterThan(2);
   });
 
+  it('cleans ignored paths from inbound client updates before storing state', async () => {
+    const { room } = freshRoom();
+    await room.load();
+
+    await room.applyClientUpdate('seed', makeUpdate((doc) => {
+      const ignoredText = new Y.Text();
+      ignoredText.insert(0, 'ignored');
+      const validText = new Y.Text();
+      validText.insert(0, 'valid');
+      doc.getMap<string>('pathToId').set('~syncthing~note.md.tmp', 'ignored-md');
+      doc.getMap<string>('idToPath').set('ignored-md', '~syncthing~note.md.tmp');
+      doc.getMap<Y.Text>('docs').set('ignored-md', ignoredText);
+      doc.getMap<string>('pathToId').set('valid.md', 'valid-md');
+      doc.getMap<string>('idToPath').set('valid-md', 'valid.md');
+      doc.getMap<Y.Text>('docs').set('valid-md', validText);
+      doc.getMap('pathToBlob').set('~syncthing~blob.png.tmp', { hash: 'ignored-hash', size: 1, updatedAt: new Date().toISOString() });
+    }));
+
+    expect(room.pathToId.has('~syncthing~note.md.tmp')).toBe(false);
+    expect(room.idToPath.has('ignored-md')).toBe(false);
+    expect(room.docs.has('ignored-md')).toBe(false);
+    expect(room.pathToBlob.has('~syncthing~blob.png.tmp')).toBe(false);
+    expect(room.pathToId.get('valid.md')).toBe('valid-md');
+    expect(room.idToPath.get('valid-md')).toBe('valid.md');
+    expect(room.docs.has('valid-md')).toBe(true);
+  });
+
   it('disposeIfIdle returns false while sessions attached', async () => {
     const { room } = freshRoom();
     const s = new MockSession('s', 'v1');
@@ -187,5 +214,75 @@ describe('VaultRoom', () => {
     await new Promise((r) => setImmediate(r));
     expect(snaps.puts.length).toBeGreaterThanOrEqual(1);
     expect(snaps.puts[0].meta.vaultId).toBe('v1');
+  });
+
+  it('dry-runs and applies ignored path cleanup without touching valid paths', async () => {
+    const { room } = freshRoom();
+    await room.load();
+    const ignoredText = new Y.Text();
+    ignoredText.insert(0, 'ignored');
+    const validText = new Y.Text();
+    validText.insert(0, 'valid');
+
+    room.pathToId.set('~syncthing~note.md.tmp', 'ignored-md');
+    room.idToPath.set('ignored-md', '~syncthing~note.md.tmp');
+    room.docs.set('ignored-md', ignoredText);
+    room.pathToId.set('valid.md', 'valid-md');
+    room.idToPath.set('valid-md', 'valid.md');
+    room.docs.set('valid-md', validText);
+    room.fileTombstones.set('~syncthing~dead.md.tmp', { deletedAt: new Date().toISOString() });
+    room.pathToBlob.set('~syncthing~blob.png.tmp', { hash: 'ignored-hash', size: 1, updatedAt: new Date().toISOString() });
+    room.pathToBlob.set('assets/valid.png', { hash: 'valid-hash', size: 2, updatedAt: new Date().toISOString() });
+    room.blobTombstones.set('~syncthing~deleted.png.tmp', { hash: 'deleted-hash', deletedAt: new Date().toISOString() });
+
+    const dryRun = await room.inspectIgnoredPathPollution();
+    expect(dryRun.dryRun).toBe(true);
+    expect(dryRun.counts.pathToId).toBe(1);
+    expect(dryRun.counts.docs).toBe(1);
+    expect(room.pathToId.has('~syncthing~note.md.tmp')).toBe(true);
+
+    const applied = await room.cleanupIgnoredPathPollution();
+    expect(applied.dryRun).toBe(false);
+    expect(applied.counts.pathToBlob).toBe(1);
+    expect(applied.counts.blobTombstones).toBe(1);
+    expect(room.pathToId.has('~syncthing~note.md.tmp')).toBe(false);
+    expect(room.idToPath.has('ignored-md')).toBe(false);
+    expect(room.docs.has('ignored-md')).toBe(false);
+    expect(room.fileTombstones.has('~syncthing~dead.md.tmp')).toBe(false);
+    expect(room.pathToBlob.has('~syncthing~blob.png.tmp')).toBe(false);
+    expect(room.blobTombstones.has('~syncthing~deleted.png.tmp')).toBe(false);
+    expect(room.pathToId.has('valid.md')).toBe(true);
+    expect(room.pathToBlob.has('assets/valid.png')).toBe(true);
+  });
+
+  it('repairs ignored reverse markdown mappings without orphaning valid docs', async () => {
+    const { room } = freshRoom();
+    await room.load();
+    const aliasedText = new Y.Text();
+    aliasedText.insert(0, 'valid through alias');
+    const reverseOnlyText = new Y.Text();
+    reverseOnlyText.insert(0, 'valid reverse only');
+
+    room.pathToId.set('valid.md', 'aliased-file');
+    room.pathToId.set('~syncthing~valid.md.tmp', 'aliased-file');
+    room.idToPath.set('aliased-file', '~syncthing~valid.md.tmp');
+    room.docs.set('aliased-file', aliasedText);
+
+    room.pathToId.set('~syncthing~reverse.md.tmp', 'reverse-file');
+    room.idToPath.set('reverse-file', 'reverse-valid.md');
+    room.docs.set('reverse-file', reverseOnlyText);
+
+    const applied = await room.cleanupIgnoredPathPollution();
+
+    expect(applied.counts.pathToId).toBe(2);
+    expect(applied.counts.idToPath).toBe(1);
+    expect(applied.counts.docs).toBe(0);
+    expect(room.pathToId.has('~syncthing~valid.md.tmp')).toBe(false);
+    expect(room.pathToId.has('~syncthing~reverse.md.tmp')).toBe(false);
+    expect(room.pathToId.get('valid.md')).toBe('aliased-file');
+    expect(room.idToPath.get('aliased-file')).toBe('valid.md');
+    expect(room.idToPath.get('reverse-file')).toBe('reverse-valid.md');
+    expect(room.docs.has('aliased-file')).toBe(true);
+    expect(room.docs.has('reverse-file')).toBe(true);
   });
 });
