@@ -212,6 +212,7 @@ export default class SaltSyncPlugin extends Plugin {
     }));
 
     this.settings = { ...DEFAULT_SETTINGS, ...saved, sharedMounts };
+    this.settings.ignoreFilePath = this.settings.ignoreFilePath?.trim().replace(/\\/g, '/').replace(/^\.\/+/g, '') ?? '';
 
     if (saved && typeof saved.enabled === 'boolean') {
       if (saved.vaultSyncEnabled === undefined) {

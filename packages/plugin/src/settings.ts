@@ -27,6 +27,8 @@ export interface SaltSyncSettings {
    */
   deviceNames?: Record<string, string>;
   vaultSyncEnabled: boolean;
+  /** 可选的 vault 相对 ignore 文件路径；语法遵循 .gitignore。留空则不启用额外忽略规则。 */
+  ignoreFilePath?: string;
   /** 兼容旧配置：逐条挂载启用前的全局共享目录开关 */
   sharedMountSyncEnabled?: boolean;
   enabled?: boolean;
@@ -42,6 +44,7 @@ export const DEFAULT_SETTINGS: SaltSyncSettings = {
   deviceName: '',    // 占位，loadSettings() 时从 deviceNames[deviceId] 读取
   deviceNames: {},
   vaultSyncEnabled: false,
+  ignoreFilePath: '',
   sharedMounts: [],
 };
 
