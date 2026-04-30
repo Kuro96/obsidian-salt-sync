@@ -114,12 +114,31 @@ curl -H 'Authorization: Bearer dev-token' http://localhost:3000/admin/api/rooms
 - 查看、创建、下载、删除、恢复 snapshots
 - 管理同步 token：创建、编辑、revoke、rotate
 - 触发带强确认的 blob GC
+- 通过管理 API dry-run / 强确认清理 ignored-path 旧污染
 - 查看脱敏后的只读配置摘要
 
 当前限制：
 
 - `/admin` 页面本身没有独立登录系统，受保护的是 `/admin/api/*`
 - 页面本身会把 admin token 保存在浏览器 `sessionStorage`（关闭标签页后自动清除）
+
+Ignored-path cleanup 可用于清理旧版本已经写入共享模型的 Syncthing 临时文件、冲突文件等忽略路径污染。默认请求只 dry-run：
+
+```bash
+curl -X POST \
+  -H 'Authorization: Bearer dev-token' \
+  http://localhost:3000/admin/api/vaults/dev-vault/ignored-paths/cleanup
+```
+
+确认无误后再执行 apply：
+
+```bash
+curl -X POST \
+  -H 'Authorization: Bearer dev-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"dryRun":false,"confirmVaultId":"dev-vault","confirmText":"cleanup ignored paths"}' \
+  http://localhost:3000/admin/api/vaults/dev-vault/ignored-paths/cleanup
+```
 
 ### 6.1 同步 token 模式切换
 
