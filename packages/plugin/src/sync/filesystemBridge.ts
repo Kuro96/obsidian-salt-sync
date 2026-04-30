@@ -254,9 +254,9 @@ export class ObsidianFilesystemBridge implements FilesystemBridge {
   }
 
   /** 共享状态 -> 磁盘：远端 tombstone 触发本地删除，走同一串行队列 */
-  async deleteFile(docPath: string): Promise<void> {
+  async deleteFile(docPath: string, shouldDelete: (file: TFile | null) => boolean = () => true): Promise<void> {
     const prev = this.writeQueues.get(docPath) ?? Promise.resolve();
-    const current = prev.then(() => this.doDeleteFile(docPath));
+    const current = prev.then(() => this.doDeleteFile(docPath, shouldDelete));
     this.writeQueues.set(docPath, current.catch(() => {}));
     return current;
   }
@@ -505,9 +505,10 @@ export class ObsidianFilesystemBridge implements FilesystemBridge {
     }
   }
 
-  private async doDeleteFile(docPath: string): Promise<void> {
+  private async doDeleteFile(docPath: string, shouldDelete: (file: TFile | null) => boolean): Promise<void> {
     const vaultPath = this.toVaultPath(docPath);
     const file = this.vault.getFileByPath(vaultPath) as TFile | null;
+    if (!shouldDelete(file)) return;
     if (!file) return;
     this.expectedDeletes.add(docPath);
     await this.vault.delete(file);

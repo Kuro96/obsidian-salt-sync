@@ -65,6 +65,37 @@ describe('ObsidianFilesystemBridge', () => {
     expect(bridge.isExpectedDelete('gone.md')).toBe(false);
   });
 
+  it('deleteFile rechecks predicate when the queued delete executes', async () => {
+    const { bridge, vault, ytextByPath, ydoc } = setup();
+    const ytext = ydoc.getText('f');
+    ytext.insert(0, 'new content');
+    ytextByPath.set('gone.md', ytext);
+    const file = vault.seedText('gone.md', 'old content');
+    let releaseModify!: () => void;
+    const modifyStarted = new Promise<void>((resolve) => {
+      const origModify = vault.modify.bind(vault);
+      vault.modify = async (f, c) => {
+        resolve();
+        await new Promise<void>((release) => {
+          releaseModify = release;
+        });
+        await origModify(f, c);
+      };
+    });
+
+    const flush = bridge.flushFile('gone.md');
+    await modifyStarted;
+    let shouldDelete = true;
+    const deletion = bridge.deleteFile('gone.md', () => shouldDelete);
+    shouldDelete = false;
+    releaseModify();
+    await Promise.all([flush, deletion]);
+
+    expect(vault.getFileByPath('gone.md')).toBe(file);
+    expect(await vault.read(file)).toBe('new content');
+    expect(bridge.isExpectedDelete('gone.md')).toBe(false);
+  });
+
   it('flushFile is serialized per path (writes do not interleave)', async () => {
     const { bridge, vault, ytextByPath, ydoc } = setup();
     const ytext = ydoc.getText('f');

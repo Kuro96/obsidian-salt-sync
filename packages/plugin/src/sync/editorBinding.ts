@@ -14,6 +14,7 @@ export interface EditorBindingHost {
   isPathForThisEngine(vaultPath: string): boolean;
   toDocPath(vaultPath: string): string;
   getOrCreateYText(docPath: string): Y.Text;
+  acceptLocalEditorContent?(docPath: string): void;
 }
 
 export interface EditorBinding {
@@ -415,6 +416,7 @@ export class EditorBindingManager {
     const editorContent = view.editor.getValue();
     if (ytext.length === 0 && editorContent.length > 0) {
       applyDiffToYText(ytext, '', editorContent, 'local-init');
+      this.host.acceptLocalEditorContent?.(this.host.toDocPath(file.path));
     }
     return ytext;
   }

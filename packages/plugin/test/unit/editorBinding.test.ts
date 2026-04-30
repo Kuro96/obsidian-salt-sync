@@ -98,6 +98,29 @@ describe('EditorBindingManager', () => {
     expect(cm.dispatched).toHaveLength(1);
   });
 
+  it('notifies host when local editor content initializes an empty ytext', () => {
+    const ydoc = new Y.Doc();
+    const acceptLocalEditorContent = vi.fn();
+    const manager = new EditorBindingManager({
+      awareness: new Awareness(ydoc),
+      readOnly: false,
+      deviceName: 'device-a',
+      isPathForThisEngine: () => true,
+      toDocPath: (path) => path,
+      getOrCreateYText: () => ydoc.getText('doc'),
+      acceptLocalEditorContent,
+    });
+    const view = makeView();
+    const cm = makeCmView();
+    (view.editor as unknown as { cm: unknown; getValue: () => string }).cm = cm;
+    view.editor.getValue = () => 'local editor content';
+
+    manager.bind(view, 'device-a');
+
+    expect(ydoc.getText('doc').toString()).toBe('local editor content');
+    expect(acceptLocalEditorContent).toHaveBeenCalledWith('note.md');
+  });
+
   it('tracks live editor views through the base extension plugin lifecycle', () => {
     const manager = new EditorBindingManager();
     const cm = makeCmView();
