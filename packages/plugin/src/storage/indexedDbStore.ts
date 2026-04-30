@@ -11,6 +11,7 @@ const MARKDOWN_PENDING_STORE_NAME = 'markdown-pending-state';
 export interface MarkdownPendingState {
   vaultId: VaultId;
   pendingLocalDeletions: string[];
+  localPath?: string;
   updatedAt: string;
 }
 

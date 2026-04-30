@@ -240,7 +240,9 @@ export class VaultSyncEngine implements SyncEngine {
   }
 
   private getOrCreateYText(docPath: string): Y.Text {
-    this.pendingLocalMarkdownDeletions.delete(docPath);
+    if (this.pendingLocalMarkdownDeletions.delete(docPath)) {
+      this.scheduleCacheSave();
+    }
     let fileId = this.pathToId.get(docPath);
     if (!fileId) {
       fileId = randomUUID();
@@ -352,7 +354,7 @@ export class VaultSyncEngine implements SyncEngine {
       undefined, // getExternalEditPolicy — use default ('always')
       (vaultPath) => this.editorBindings.isHealthyBinding(vaultPath),
       (docPath) => this.handleExternalMarkdownDeletion(docPath),
-      (docPath) => this.fileTombstones.has(docPath),
+      (docPath) => this.shouldBlockRemoteMarkdownFlush(docPath),
     );
 
     this.blobSync = new BlobSync(
@@ -712,7 +714,9 @@ export class VaultSyncEngine implements SyncEngine {
     // vault.create from another tool) never get a Y.Text and drain silently
     // skips them in importFromDisk.
     const docPath = this.toDocPath(vaultPath);
-    this.pendingLocalMarkdownDeletions.delete(docPath);
+    if (this.pendingLocalMarkdownDeletions.delete(docPath)) {
+      this.scheduleCacheSave();
+    }
     this.knownLocalMarkdownPaths.add(docPath);
     this.getOrCreateYText(docPath);
     this.bridge.markDirty(vaultPath);
@@ -759,16 +763,39 @@ export class VaultSyncEngine implements SyncEngine {
     this.writeLocalMarkdownTombstone(docPath, fileId);
   }
 
+  private getExistingPendingLocalMarkdownPaths(): Set<string> {
+    const existing = new Set<string>();
+    for (const docPath of this.pendingLocalMarkdownDeletions) {
+      if (this.plugin.app.vault.getAbstractFileByPath(this.toVaultPath(docPath))) {
+        existing.add(docPath);
+      }
+    }
+    return existing;
+  }
+
+  private flushPendingLocalMarkdownDeletionsFromDiskState(): void {
+    this.flushPendingLocalMarkdownDeletions(this.getExistingPendingLocalMarkdownPaths());
+  }
+
+  private shouldBlockRemoteMarkdownFlush(docPath: string): boolean {
+    if (this.fileTombstones.has(docPath)) return true;
+    if (!this.pendingLocalMarkdownDeletions.has(docPath)) return false;
+    return !this.plugin.app.vault.getAbstractFileByPath(this.toVaultPath(docPath));
+  }
+
   private flushPendingLocalMarkdownDeletions(localDocPaths: Set<string>): void {
+    let pendingChanged = false;
     for (const docPath of [...this.pendingLocalMarkdownDeletions]) {
       if (localDocPaths.has(docPath)) {
         this.pendingLocalMarkdownDeletions.delete(docPath);
+        pendingChanged = true;
         continue;
       }
       const fileId = this.pathToId.get(docPath);
       if (!fileId) continue;
       this.writeLocalMarkdownTombstone(docPath, fileId);
     }
+    if (pendingChanged) this.scheduleCacheSave();
   }
 
   private writeLocalMarkdownTombstone(docPath: string, fileId: string): void {
@@ -944,6 +971,7 @@ export class VaultSyncEngine implements SyncEngine {
     await this.markdownPendingStore.save(this.localCacheKey, {
       vaultId: this.localCacheKey,
       pendingLocalDeletions: [...this.pendingLocalMarkdownDeletions],
+      localPath: this.mount?.localPath,
       updatedAt: new Date().toISOString(),
     });
   }
@@ -951,6 +979,7 @@ export class VaultSyncEngine implements SyncEngine {
   private async restoreMarkdownPending(): Promise<void> {
     const saved = await this.markdownPendingStore.load(this.localCacheKey);
     if (!saved) return;
+    if (saved.localPath !== this.mount?.localPath) return;
 
     for (const docPath of saved.pendingLocalDeletions) {
       if (this.pendingLocalMarkdownDeletions.has(docPath)) continue;
@@ -987,6 +1016,10 @@ export class VaultSyncEngine implements SyncEngine {
 
   private async openMarkdownDeleteGate(): Promise<void> {
     this.markdownDeleteGateState = 'open';
+    // Remote updates can attach fileIds to pending local deletions while the
+    // gate is in maintenance. Flush them once the gate opens so the delete
+    // intent does not wait for another remote transaction.
+    this.flushPendingLocalMarkdownDeletionsFromDiskState();
     for (const decision of this.markdownTombstones.getReplayDecisions()) {
       this.queueRemoteMarkdownDelete(decision.path);
     }
@@ -1069,7 +1102,7 @@ export class VaultSyncEngine implements SyncEngine {
     // with a proper localDocPaths set — flushing here with an empty set would
     // convert every pending path into a tombstone prematurely.
     if (this.markdownDeleteGateState === 'open') {
-      this.flushPendingLocalMarkdownDeletions(new Set());
+      this.flushPendingLocalMarkdownDeletionsFromDiskState();
     }
     const changedDocIds = mapChanged(txn, this.docs) ? changedMapKeys(txn, this.docs) : [];
     this.bridge.handleRemoteTransaction(txn, this.docs, this.idToPath, changedDocIds);
@@ -1146,12 +1179,9 @@ export class VaultSyncEngine implements SyncEngine {
     await this.client.send({ type: 'sync_state_vector', sv });
     if (this.hasAuthenticated) {
       this.enterMarkdownMaintenanceGate();
-      try {
-        await this.reconcile();
-        await this.runBlobMaintenance(this.mount?.readOnly ? 'conservative' : 'authoritative');
-      } finally {
-        await this.openMarkdownDeleteGate();
-      }
+      await this.reconcile();
+      await this.runBlobMaintenance(this.mount?.readOnly ? 'conservative' : 'authoritative');
+      await this.openMarkdownDeleteGate();
       this.bindAllOpenEditors();
       this.validateAllOpenBindings();
     } else {

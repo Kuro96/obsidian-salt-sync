@@ -1119,6 +1119,7 @@ describe('VaultSyncEngine', () => {
         handleRemoteUpdate: (update: Uint8Array) => Promise<void>;
         completeInitialSync: () => Promise<void>;
         runBlobMaintenance: () => Promise<void>;
+        markdownDeleteGateState: string;
       };
       self.cache = {
         load: async () => null,
@@ -1138,7 +1139,7 @@ describe('VaultSyncEngine', () => {
 
       self.bridge.deleteFile = vi.fn(async () => {});
       self.bridge.notifyFileClosed = vi.fn();
-      return { engine, self };
+      return { engine, self, plugin };
     }
 
     function applyRemoteTombstone(engine: VaultSyncEngine, path: string): void {
@@ -1233,6 +1234,131 @@ describe('VaultSyncEngine', () => {
       // (gate is startup-blocked → maintenance-blocked, not open)
       expect(tombstones.has('pending-del.md')).toBe(false);
       expect(internals(engine).pendingLocalMarkdownDeletions.has('pending-del.md')).toBe(true);
+
+      await engine.stop();
+    });
+
+    it('flushes maintenance pending local markdown deletions when opening the gate', async () => {
+      const { engine, self } = await setupStartedEngine();
+      const { ydoc, pathToId, idToPath, docs, tombstones, pendingLocalMarkdownDeletions } = internals(engine);
+
+      engine.handleLocalFileDeletion('pending-during-maintenance.md');
+      expect(pendingLocalMarkdownDeletions.has('pending-during-maintenance.md')).toBe(true);
+
+      await self.handleAuthOk();
+      let finishBlobMaintenance!: () => void;
+      self.runBlobMaintenance = () => new Promise<void>((resolve) => {
+        finishBlobMaintenance = resolve;
+      });
+      const initialSync = self.completeInitialSync();
+      await flushPromises();
+      expect(self.markdownDeleteGateState).toBe('maintenance-blocked');
+
+      const fid = 'file-maintenance-pending';
+      const text = new Y.Text();
+      text.insert(0, 'remote content');
+      ydoc.transact(() => {
+        pathToId.set('pending-during-maintenance.md', fid);
+        idToPath.set(fid, 'pending-during-maintenance.md');
+        docs.set(fid, text);
+      }, 'remote');
+
+      expect(tombstones.has('pending-during-maintenance.md')).toBe(false);
+
+      finishBlobMaintenance();
+      await initialSync;
+
+      expect(tombstones.has('pending-during-maintenance.md')).toBe(true);
+      expect(pathToId.has('pending-during-maintenance.md')).toBe(false);
+      expect(pendingLocalMarkdownDeletions.has('pending-during-maintenance.md')).toBe(false);
+
+      await engine.stop();
+    });
+
+    it('does not tombstone pending local markdown deletion if file is restored before gate opens', async () => {
+      const { engine, self, plugin } = await setupStartedEngine();
+      const { ydoc, pathToId, idToPath, docs, tombstones, pendingLocalMarkdownDeletions } = internals(engine);
+
+      engine.handleLocalFileDeletion('restored-before-open.md');
+      expect(pendingLocalMarkdownDeletions.has('restored-before-open.md')).toBe(true);
+
+      await self.handleAuthOk();
+      let finishBlobMaintenance!: () => void;
+      self.runBlobMaintenance = () => new Promise<void>((resolve) => {
+        finishBlobMaintenance = resolve;
+      });
+      const initialSync = self.completeInitialSync();
+      await flushPromises();
+
+      const fid = 'file-restored-before-open';
+      const text = new Y.Text();
+      text.insert(0, 'remote content');
+      ydoc.transact(() => {
+        pathToId.set('restored-before-open.md', fid);
+        idToPath.set(fid, 'restored-before-open.md');
+        docs.set(fid, text);
+      }, 'remote');
+      plugin.app.vault.seedText('restored-before-open.md', 'local restored');
+
+      finishBlobMaintenance();
+      await initialSync;
+
+      expect(tombstones.has('restored-before-open.md')).toBe(false);
+      expect(pathToId.has('restored-before-open.md')).toBe(true);
+      expect(pendingLocalMarkdownDeletions.has('restored-before-open.md')).toBe(false);
+
+      await engine.stop();
+    });
+
+    it('does not tombstone open-gate pending deletion when remote fileId arrives after local restore', async () => {
+      const { engine, self, plugin } = await setupStartedEngine();
+      const { ydoc, pathToId, idToPath, docs, tombstones, pendingLocalMarkdownDeletions } = internals(engine);
+
+      engine.handleLocalFileDeletion('restored-while-open.md');
+      await self.handleAuthOk();
+      await self.completeInitialSync();
+      expect(pendingLocalMarkdownDeletions.has('restored-while-open.md')).toBe(true);
+
+      plugin.app.vault.seedText('restored-while-open.md', 'local restored');
+      const fid = 'file-restored-while-open';
+      const text = new Y.Text();
+      text.insert(0, 'remote content');
+      ydoc.transact(() => {
+        pathToId.set('restored-while-open.md', fid);
+        idToPath.set(fid, 'restored-while-open.md');
+        docs.set(fid, text);
+      }, 'remote');
+
+      expect(tombstones.has('restored-while-open.md')).toBe(false);
+      expect(pathToId.has('restored-while-open.md')).toBe(true);
+      expect(pendingLocalMarkdownDeletions.has('restored-while-open.md')).toBe(false);
+
+      await engine.stop();
+    });
+
+    it('does not open markdown delete gate or flush pending when reconnect maintenance fails', async () => {
+      const { engine, self } = await setupStartedEngine();
+      const { ydoc, pathToId, idToPath, docs, tombstones, pendingLocalMarkdownDeletions } = internals(engine);
+
+      await self.handleAuthOk();
+      await self.completeInitialSync();
+
+      const fid = 'file-reconnect-fail';
+      const text = new Y.Text();
+      text.insert(0, 'remote content');
+      ydoc.transact(() => {
+        pathToId.set('pending-reconnect-fail.md', fid);
+        idToPath.set(fid, 'pending-reconnect-fail.md');
+        docs.set(fid, text);
+      });
+      pendingLocalMarkdownDeletions.add('pending-reconnect-fail.md');
+      vi.spyOn(engine, 'reconcile').mockRejectedValueOnce(new Error('reconnect failed'));
+
+      await expect(self.handleAuthOk()).rejects.toThrow('reconnect failed');
+
+      expect(self.markdownDeleteGateState).toBe('maintenance-blocked');
+      expect(tombstones.has('pending-reconnect-fail.md')).toBe(false);
+      expect(pendingLocalMarkdownDeletions.has('pending-reconnect-fail.md')).toBe(true);
 
       await engine.stop();
     });
@@ -1655,6 +1781,33 @@ describe('VaultSyncEngine', () => {
       await self.restoreMarkdownPending();
 
       expect(pendingLocalMarkdownDeletions.has('already-dead.md')).toBe(false);
+    });
+
+    it('restored pending skips entries from a different shared mount localPath', async () => {
+      const plugin = new MockPlugin();
+      const mount: SharedDirectoryMount = {
+        localPath: 'NewShared',
+        vaultId: 'shared-vault',
+        token: 'shared-token',
+      };
+      const engine = new VaultSyncEngine(plugin as unknown as Plugin, baseSettings(), mount);
+      const { pendingLocalMarkdownDeletions } = internals(engine);
+      const self = engine as unknown as {
+        markdownPendingStore: {
+          load: () => Promise<{ pendingLocalDeletions: string[]; localPath?: string } | null>;
+          save: (_key: string, state: { pendingLocalDeletions: string[]; localPath?: string }) => Promise<void>;
+        };
+        restoreMarkdownPending: () => Promise<void>;
+      };
+
+      self.markdownPendingStore = {
+        load: async () => ({ pendingLocalDeletions: ['old-path.md'], localPath: 'OldShared', vaultId: 'test', updatedAt: '' }),
+        save: vi.fn(async () => {}),
+      };
+
+      await self.restoreMarkdownPending();
+
+      expect(pendingLocalMarkdownDeletions.has('old-path.md')).toBe(false);
     });
   });
 });
