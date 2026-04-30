@@ -963,6 +963,42 @@ describe('BlobSync reconcile', () => {
     expect(runtime.snapshot()).toBeNull();
   });
 
+  it('drops orphan pending local deletions when no remote ref or hash exists after reconcile', async () => {
+    const runtime = createRuntimeStateStore();
+    await runtime.store.save('vault-a', {
+      vaultId: 'vault-a',
+      pendingRemoteDownloads: [],
+      pendingRemoteDeletes: [],
+      pendingLocalUpserts: [],
+      pendingLocalDeletions: [{ docPath: '未命名', hash: null }],
+      knownLocalPaths: ['未命名'],
+      updatedAt: new Date().toISOString(),
+    });
+
+    const vault = new MockVault();
+    const ydoc = new Y.Doc();
+    const sync = new BlobSync(
+      'ws://server.test',
+      'vault-a',
+      'token-a',
+      vault as never,
+      ydoc,
+      undefined,
+      undefined,
+      undefined,
+      runtime.store,
+    );
+
+    await sync.restoreRuntimeState();
+    expect(sync.getPendingBlobItems()).toEqual([{ kind: 'local-delete', path: '未命名', hash: null }]);
+
+    await sync.reconcile('authoritative');
+    await sync.flushPersistChain();
+
+    expect(sync.getPendingBlobItems()).toEqual([]);
+    expect(runtime.snapshot()).toBeNull();
+  });
+
   it('does not restore pending local deletions saved for a different shared mount localPath', async () => {
     const bytes = new Uint8Array([4, 2, 0]);
     const hash = sha256hex(bytes);

@@ -604,6 +604,7 @@ export class BlobSync {
     if (knownLocalPathsChanged) {
       this.persistRuntimeState();
     }
+    this.discardUnresolvableLocalDeletions();
   }
 
   private isMissingLocalBlob(docPath: string): boolean {
@@ -711,6 +712,23 @@ export class BlobSync {
       }
     }, 'local-blob');
     if (mutated) {
+      this.notifyPendingLocalDeletionsChange();
+      this.persistRuntimeState();
+    }
+  }
+
+  private discardUnresolvableLocalDeletions(): void {
+    let changed = false;
+    for (const [docPath, knownHash] of [...this.pendingLocalDeletions]) {
+      if (knownHash) continue;
+      if (this.pathToBlob.has(docPath)) continue;
+      if (this.blobTombstones.has(docPath)) continue;
+      if (this.vault.getAbstractFileByPath(this.toVaultPath(docPath))) continue;
+      this.pendingLocalDeletions.delete(docPath);
+      this.knownLocalPaths.delete(docPath);
+      changed = true;
+    }
+    if (changed) {
       this.notifyPendingLocalDeletionsChange();
       this.persistRuntimeState();
     }
