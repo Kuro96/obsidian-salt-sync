@@ -61,13 +61,17 @@ export class ObsidianFilesystemBridge implements FilesystemBridge {
     private readonly onExternalDeletion?: (docPath: string) => void,
     /** Optional: returns true if the docPath has been tombstoned and must not be recreated */
     private readonly isDeletedPath?: (docPath: string) => boolean,
+    /** Optional: returns true if the docPath should never be imported, written, or deleted by sync */
+    private readonly isIgnoredPath: (docPath: string) => boolean = () => false,
   ) {}
 
   // ── FilesystemBridge interface ────────────────────────────────────────────
 
   /** 磁盘 -> 共享状态：将 vaultPath 转换为 docPath 后加入 dirty set */
   markDirty(vaultPath: string): void {
-    this.dirtySet.add(this.toDocPath(vaultPath));
+    const docPath = this.toDocPath(vaultPath);
+    if (this.isIgnoredPath(docPath)) return;
+    this.dirtySet.add(docPath);
     this.scheduleDrain();
   }
 
@@ -94,6 +98,7 @@ export class ObsidianFilesystemBridge implements FilesystemBridge {
 
   /** 共享状态 -> 磁盘：串行写回指定 docPath */
   async flushFile(docPath: string): Promise<void> {
+    if (this.isIgnoredPath(docPath)) return;
     return this.enqueueFlushFile(docPath, this.currentWriteGeneration(docPath));
   }
 
@@ -117,6 +122,7 @@ export class ObsidianFilesystemBridge implements FilesystemBridge {
   }
 
   async forceImportFromDisk(docPath: string): Promise<void> {
+    if (this.isIgnoredPath(docPath)) return;
     this.invalidateQueuedWrites(docPath);
     this.cancelOpenWriteTimer(docPath);
     this.dirtySet.delete(docPath);
@@ -130,6 +136,7 @@ export class ObsidianFilesystemBridge implements FilesystemBridge {
 
   notifyFileOpened(vaultPath: string): void {
     const docPath = this.toDocPath(vaultPath);
+    if (this.isIgnoredPath(docPath)) return;
     this.openDocPaths.add(docPath);
     this.activeDocPath = docPath;
     this.attachTextObserver(docPath);
@@ -137,6 +144,7 @@ export class ObsidianFilesystemBridge implements FilesystemBridge {
 
   notifyFileClosed(vaultPath: string): void {
     const docPath = this.toDocPath(vaultPath);
+    if (this.isIgnoredPath(docPath)) return;
     this.openDocPaths.delete(docPath);
     if (this.activeDocPath === docPath) {
       this.activeDocPath = null;
@@ -224,6 +232,7 @@ export class ObsidianFilesystemBridge implements FilesystemBridge {
     for (const fileId of changedDocIds) {
       const docPath = idToPath.get(fileId);
       if (!docPath) continue;
+      if (this.isIgnoredPath(docPath)) continue;
       if (this.openDocPaths.has(docPath)) {
         const hasObserver = this.textObservers.has(docPath);
         console.debug(`[SaltSync:Bridge] remote update for open file, scheduling write as fallback`, {
@@ -240,6 +249,7 @@ export class ObsidianFilesystemBridge implements FilesystemBridge {
       if (!mapChanged(txn, ytext)) continue;
       const docPath = idToPath.get(fileId);
       if (!docPath) continue;
+      if (this.isIgnoredPath(docPath)) continue;
       if (this.openDocPaths.has(docPath)) {
         const hasObserver = this.textObservers.has(docPath);
         console.debug(`[SaltSync:Bridge] remote Y.Text change for open file, scheduling write as fallback`, {
@@ -255,6 +265,7 @@ export class ObsidianFilesystemBridge implements FilesystemBridge {
 
   /** 共享状态 -> 磁盘：远端 tombstone 触发本地删除，走同一串行队列 */
   async deleteFile(docPath: string, shouldDelete: (file: TFile | null) => boolean = () => true): Promise<void> {
+    if (this.isIgnoredPath(docPath)) return;
     const prev = this.writeQueues.get(docPath) ?? Promise.resolve();
     const current = prev.then(() => this.doDeleteFile(docPath, shouldDelete));
     this.writeQueues.set(docPath, current.catch(() => {}));
@@ -471,6 +482,7 @@ export class ObsidianFilesystemBridge implements FilesystemBridge {
 
   /** 共享状态 -> 磁盘：实际写入逻辑，在串行队列中执行 */
   private async doFlushFile(docPath: string, generation: number): Promise<void> {
+    if (this.isIgnoredPath(docPath)) return;
     if (this.remoteFlushQuarantine.has(docPath)) return;
     if (generation !== this.currentWriteGeneration(docPath)) return;
     if (this.isDeletedPath?.(docPath)) return;

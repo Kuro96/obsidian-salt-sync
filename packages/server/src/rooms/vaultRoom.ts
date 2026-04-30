@@ -10,6 +10,7 @@ import {
   SAVE_DEBOUNCE_MS,
   SCHEMA_VERSION,
   AUTO_SNAPSHOT_ENTRIES,
+  isPathIgnoredBySync,
 } from '@salt-sync/shared';
 import type {
   VaultId,
@@ -26,6 +27,45 @@ import { docFromPayload } from '../snapshots/snapshotUtils.js';
 
 function sha256hex(data: Uint8Array): string {
   return crypto.createHash('sha256').update(data).digest('hex');
+}
+
+export type IgnoredPathCleanupMap =
+  | 'pathToId'
+  | 'idToPath'
+  | 'docs'
+  | 'fileTombstones'
+  | 'pathToBlob'
+  | 'blobTombstones';
+
+export interface IgnoredPathCleanupEntry {
+  map: IgnoredPathCleanupMap;
+  path: string;
+  fileId?: string;
+  hash?: string;
+  replacementPath?: string;
+}
+
+export interface IgnoredPathCleanupResult {
+  dryRun: boolean;
+  removed: IgnoredPathCleanupEntry[];
+  counts: Record<IgnoredPathCleanupMap, number>;
+}
+
+const EMPTY_IGNORED_COUNTS: Record<IgnoredPathCleanupMap, number> = {
+  pathToId: 0,
+  idToPath: 0,
+  docs: 0,
+  fileTombstones: 0,
+  pathToBlob: 0,
+  blobTombstones: 0,
+};
+
+function makeIgnoredCleanupResult(dryRun: boolean, removed: IgnoredPathCleanupEntry[]): IgnoredPathCleanupResult {
+  const counts = { ...EMPTY_IGNORED_COUNTS };
+  for (const entry of removed) {
+    counts[entry.map] += 1;
+  }
+  return { dryRun, removed, counts };
 }
 
 export class VaultRoom {
@@ -214,7 +254,10 @@ export class VaultRoom {
 
   async applyClientUpdate(sessionId: string, update: Uint8Array): Promise<void> {
     this.markActivity();
-    Y.applyUpdate(this.ydoc, update, sessionId);
+    this.ydoc.transact(() => {
+      Y.applyUpdate(this.ydoc, update);
+      this.applyIgnoredPathCleanupEntries(this.collectIgnoredPathCleanupEntries());
+    }, sessionId);
   }
 
   async applyAwareness(sessionId: string, payload: Uint8Array): Promise<void> {
@@ -248,6 +291,23 @@ export class VaultRoom {
       blobTombstoneCount: this.blobTombstones.size,
       loaded: this.loaded,
     };
+  }
+
+  async inspectIgnoredPathPollution(): Promise<IgnoredPathCleanupResult> {
+    await this.load();
+    return makeIgnoredCleanupResult(true, this.collectIgnoredPathCleanupEntries());
+  }
+
+  async cleanupIgnoredPathPollution(): Promise<IgnoredPathCleanupResult> {
+    await this.load();
+    const removed = this.collectIgnoredPathCleanupEntries();
+    if (removed.length === 0) return makeIgnoredCleanupResult(false, []);
+
+    this.ydoc.transact(() => this.applyIgnoredPathCleanupEntries(removed), 'admin-ignored-cleanup');
+
+    await this.saveNow();
+    this.markActivity();
+    return makeIgnoredCleanupResult(false, removed);
   }
 
   async snapshotNow(triggeredBy?: string): Promise<SnapshotMeta> {
@@ -393,6 +453,70 @@ export class VaultRoom {
     this.lastCheckpointVersion = newVersion;
     this.markActivity();
     console.log(`[VaultRoom:${this.vaultId}] compacted to checkpoint v${newVersion}`);
+  }
+
+  private collectIgnoredPathCleanupEntries(): IgnoredPathCleanupEntry[] {
+    const entries: IgnoredPathCleanupEntry[] = [];
+    const ignoredFileIds = new Set<string>();
+
+    for (const [path, fileId] of this.pathToId) {
+      if (!isPathIgnoredBySync(path)) continue;
+      entries.push({ map: 'pathToId', path, fileId });
+      ignoredFileIds.add(fileId);
+    }
+
+    for (const [fileId, path] of this.idToPath) {
+      if (!isPathIgnoredBySync(path)) continue;
+      const replacementPath = this.findNonIgnoredPathForFileId(fileId);
+      entries.push({ map: 'idToPath', path, fileId, replacementPath });
+      ignoredFileIds.add(fileId);
+    }
+
+    for (const fileId of ignoredFileIds) {
+      const hasNonIgnoredPath = this.hasNonIgnoredPathForFileId(fileId);
+      if (!hasNonIgnoredPath && this.docs.has(fileId)) {
+        entries.push({ map: 'docs', path: this.idToPath.get(fileId) ?? fileId, fileId });
+      }
+    }
+
+    for (const [path] of this.fileTombstones) {
+      if (isPathIgnoredBySync(path)) entries.push({ map: 'fileTombstones', path });
+    }
+
+    for (const [path, ref] of this.pathToBlob) {
+      if (isPathIgnoredBySync(path)) entries.push({ map: 'pathToBlob', path, hash: ref.hash });
+    }
+
+    for (const [path, tombstone] of this.blobTombstones) {
+      if (isPathIgnoredBySync(path)) entries.push({ map: 'blobTombstones', path, hash: tombstone.hash });
+    }
+
+    return entries;
+  }
+
+  private applyIgnoredPathCleanupEntries(entries: IgnoredPathCleanupEntry[]): void {
+    for (const entry of entries) {
+      if (entry.map === 'pathToId') this.pathToId.delete(entry.path);
+      else if (entry.map === 'idToPath' && entry.fileId && entry.replacementPath) this.idToPath.set(entry.fileId, entry.replacementPath);
+      else if (entry.map === 'idToPath' && entry.fileId) this.idToPath.delete(entry.fileId);
+      else if (entry.map === 'docs' && entry.fileId) this.docs.delete(entry.fileId);
+      else if (entry.map === 'fileTombstones') this.fileTombstones.delete(entry.path);
+      else if (entry.map === 'pathToBlob') this.pathToBlob.delete(entry.path);
+      else if (entry.map === 'blobTombstones') this.blobTombstones.delete(entry.path);
+    }
+  }
+
+  private findNonIgnoredPathForFileId(fileId: string): string | undefined {
+    for (const [path, mappedFileId] of this.pathToId) {
+      if (mappedFileId === fileId && !isPathIgnoredBySync(path)) return path;
+    }
+    return undefined;
+  }
+
+  private hasNonIgnoredPathForFileId(fileId: string): boolean {
+    if (this.findNonIgnoredPathForFileId(fileId)) return true;
+    const reversePath = this.idToPath.get(fileId);
+    return !!reversePath && !isPathIgnoredBySync(reversePath);
   }
 
   private markActivity(): void {

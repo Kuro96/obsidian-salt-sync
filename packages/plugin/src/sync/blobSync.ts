@@ -16,6 +16,16 @@ interface BlobRuntimeStateStore {
 
 export type BlobApplyGateState = 'startup-blocked' | 'maintenance-blocked' | 'open';
 
+export type PendingBlobItemKind = 'download' | 'upload' | 'remote-delete' | 'local-delete';
+
+export interface PendingBlobItem {
+  kind: PendingBlobItemKind;
+  path: string;
+  hash?: string | null;
+  size?: number;
+  contentType?: string;
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 function sha256hex(bytes: Uint8Array): string {
@@ -117,6 +127,7 @@ export class BlobSync {
 
   /** 本地附件新建或修改时调用（path 为 docPath） */
   async handleLocalBlobChange(path: string): Promise<void> {
+    if (this.isIgnoredDocPath(path)) return;
     this.pendingLocalUpserts.add(path);
     this.notifyPendingUploadsChange();
     this.persistRuntimeState();
@@ -132,6 +143,7 @@ export class BlobSync {
    * 异步部分：与同路径的 upsert/delete 严格串行，真正写 tombstone。
    */
   async handleLocalBlobDeletion(path: string): Promise<void> {
+    if (this.isIgnoredDocPath(path)) return;
     const ref = this.pathToBlob.get(path);
     const cachedHash = this.hashCache.peek(path);
     const knownHash = ref?.hash ?? cachedHash ?? null;
@@ -158,6 +170,7 @@ export class BlobSync {
     const ptbMap = this.pathToBlob;
     if (mapChanged(txn, ptbMap)) {
       for (const path of changedMapKeys(txn, ptbMap)) {
+        if (this.isIgnoredDocPath(path)) continue;
         const ref = ptbMap.get(path);
         if (ref) {
           this.pendingRemoteDeletes.delete(path);
@@ -173,6 +186,7 @@ export class BlobSync {
     const tombMap = this.blobTombstones;
     if (mapChanged(txn, tombMap)) {
       for (const path of changedMapKeys(txn, tombMap)) {
+        if (this.isIgnoredDocPath(path)) continue;
         if (tombMap.has(path)) {
           const removedPendingDownload = this.pendingRemoteDownloads.delete(path);
           if (removedPendingDownload) {
@@ -199,6 +213,7 @@ export class BlobSync {
 
   /** restore 等本地流程使用：按当前 pathToBlob 元数据物化到磁盘。 */
   async materializeBlob(docPath: string): Promise<void> {
+    if (this.isIgnoredDocPath(docPath)) return;
     const ref = this.pathToBlob.get(docPath);
     if (!ref) return;
     await this.downloadIfMissing(docPath, ref);
@@ -214,6 +229,7 @@ export class BlobSync {
 
   /** restore 等本地流程使用：删除某个本地附件。 */
   async deleteLocalBlob(docPath: string): Promise<void> {
+    if (this.isIgnoredDocPath(docPath)) return;
     await this.enqueuePathOperation(docPath, async () => {
       await this.deleteLocalFile(docPath);
     });
@@ -255,6 +271,24 @@ export class BlobSync {
 
   get pendingLocalDeletionCount(): number {
     return this.pendingLocalDeletions.size;
+  }
+
+  getPendingBlobItems(): PendingBlobItem[] {
+    return [
+      ...[...this.pendingRemoteDownloads].map(([path, ref]) => ({
+        kind: 'download' as const,
+        path,
+        hash: ref.hash,
+        size: ref.size,
+        contentType: ref.contentType,
+      })),
+      ...[...this.pendingLocalUpserts].map((path) => ({ kind: 'upload' as const, path })),
+      ...[...this.pendingRemoteDeletes].map((path) => {
+        const tombstone = this.blobTombstones.get(path);
+        return { kind: 'remote-delete' as const, path, hash: tombstone?.hash };
+      }),
+      ...[...this.pendingLocalDeletions].map(([path, hash]) => ({ kind: 'local-delete' as const, path, hash })),
+    ].filter((item) => !this.isIgnoredDocPath(item.path));
   }
 
   onPendingDownloadsChange(handler: () => void): () => void {
@@ -326,6 +360,7 @@ export class BlobSync {
     // 合并而非替换：注册 ydoc 监听和 restoreRuntimeState 之间可能已有新的 pending 写入，
     // 这里只补还 IDB 中尚未进入内存的条目，避免覆盖启动窗口期新产生的 pending。
     for (const item of restored.pendingRemoteDownloads) {
+      if (this.isIgnoredDocPath(item.docPath)) continue;
       if (this.pendingRemoteDownloads.has(item.docPath)) continue;
       const ref = this.pathToBlob.get(item.docPath);
       if (ref && ref.hash === item.hash) {
@@ -335,6 +370,7 @@ export class BlobSync {
     }
 
     for (const docPath of restored.pendingRemoteDeletes) {
+      if (this.isIgnoredDocPath(docPath)) continue;
       if (this.pendingRemoteDeletes.has(docPath)) continue;
       if (this.blobTombstones.has(docPath)) {
         this.pendingRemoteDeletes.add(docPath);
@@ -343,6 +379,7 @@ export class BlobSync {
     this.notifyPendingRemoteDeletesChange();
 
     for (const docPath of restored.pendingLocalUpserts) {
+      if (this.isIgnoredDocPath(docPath)) continue;
       if (this.pendingLocalUpserts.has(docPath)) continue;
       if (this.vault.getAbstractFileByPath(this.toVaultPath(docPath))) {
         this.pendingLocalUpserts.add(docPath);
@@ -352,6 +389,7 @@ export class BlobSync {
 
     if (localPathMatches) {
       for (const item of restored.pendingLocalDeletions ?? []) {
+        if (this.isIgnoredDocPath(item.docPath)) continue;
         if (this.pendingLocalDeletions.has(item.docPath)) continue;
         // 文件又出现了说明用户撤销了删除，放弃这条 pending。
         if (this.vault.getAbstractFileByPath(this.toVaultPath(item.docPath))) continue;
@@ -366,6 +404,7 @@ export class BlobSync {
     // 是针对旧路径的，不能用于新路径的"缺失即删除"判断，直接跳过。
     if (localPathMatches) {
       for (const path of restored.knownLocalPaths ?? []) {
+        if (this.isIgnoredDocPath(path)) continue;
         if (this.knownLocalPaths.has(path)) continue;
         // 已有 tombstone 说明删除已确认，无需再跟踪。
         if (this.blobTombstones.has(path)) continue;
@@ -378,6 +417,10 @@ export class BlobSync {
   }
 
   // ── private ───────────────────────────────────────────────────────────────
+
+  private isIgnoredDocPath(docPath: string): boolean {
+    return isPathIgnoredBySync(docPath) || isPathIgnoredBySync(this.toVaultPath(docPath));
+  }
 
   private async uploadIfNeeded(
     hash: BlobHash,
@@ -541,6 +584,7 @@ export class BlobSync {
     }
 
     for (const [docPath, ref] of this.pathToBlob) {
+      if (this.isIgnoredDocPath(docPath)) continue;
       if (localSet.has(docPath)) continue;
       // Phase 10：tombstone 优先。pathToBlob 与 blobTombstones 可能同 key 并存（跨设备 LWW），
       // 此时必须以 tombstone 为准，不触发下载。
@@ -579,6 +623,11 @@ export class BlobSync {
     const errors: unknown[] = [];
 
     for (const docPath of [...this.pendingRemoteDeletes]) {
+      if (this.isIgnoredDocPath(docPath)) {
+        this.pendingRemoteDeletes.delete(docPath);
+        this.notifyPendingRemoteDeletesChange();
+        continue;
+      }
       this.pendingRemoteDeletes.delete(docPath);
       this.notifyPendingRemoteDeletesChange();
       await this.enqueuePathOperation(docPath, async () => {
@@ -588,6 +637,11 @@ export class BlobSync {
     }
 
     for (const [docPath, ref] of [...this.pendingRemoteDownloads]) {
+      if (this.isIgnoredDocPath(docPath)) {
+        this.pendingRemoteDownloads.delete(docPath);
+        this.notifyPendingDownloadsChange();
+        continue;
+      }
       this.pendingRemoteDownloads.delete(docPath);
       this.notifyPendingDownloadsChange();
       await this.enqueuePathOperation(docPath, async () => {
@@ -607,6 +661,7 @@ export class BlobSync {
   private queueExistingRemoteTombstones(): void {
     let changed = false;
     for (const docPath of this.blobTombstones.keys()) {
+      if (this.isIgnoredDocPath(docPath)) continue;
       if (this.pendingRemoteDeletes.has(docPath)) continue;
       this.pendingRemoteDeletes.add(docPath);
       changed = true;
@@ -622,6 +677,11 @@ export class BlobSync {
     let mutated = false;
     this.ydoc.transact(() => {
       for (const [docPath, knownHash] of [...this.pendingLocalDeletions]) {
+        if (this.isIgnoredDocPath(docPath)) {
+          this.pendingLocalDeletions.delete(docPath);
+          mutated = true;
+          continue;
+        }
         // 本地文件又出现了 → 用户可能撤销删除，让随后的 upsert/rescan 处理。
         if (this.vault.getAbstractFileByPath(this.toVaultPath(docPath))) {
           this.pendingLocalDeletions.delete(docPath);
@@ -659,6 +719,11 @@ export class BlobSync {
   private async flushPendingLocalUpserts(): Promise<void> {
     const errors: unknown[] = [];
     for (const docPath of [...this.pendingLocalUpserts]) {
+      if (this.isIgnoredDocPath(docPath)) {
+        this.pendingLocalUpserts.delete(docPath);
+        this.notifyPendingUploadsChange();
+        continue;
+      }
       await this.enqueuePathOperation(docPath, () => this.processLocalBlobUpsert(docPath)).catch((err) => {
         // 单条 upsert 失败不阻断后续；pendingLocalUpserts 里它仍在，下次 flush 会重试。
         errors.push(err);
@@ -808,28 +873,38 @@ export class BlobSync {
   }
 
   private takeRuntimeStateSnapshot(): BlobRuntimeState | null {
+    const pendingRemoteDownloads = [...this.pendingRemoteDownloads]
+      .filter(([docPath]) => !this.isIgnoredDocPath(docPath))
+      .map(([docPath, ref]) => ({
+        docPath,
+        hash: ref.hash,
+      }));
+    const pendingRemoteDeletes = [...this.pendingRemoteDeletes].filter((docPath) => !this.isIgnoredDocPath(docPath));
+    const pendingLocalUpserts = [...this.pendingLocalUpserts].filter((docPath) => !this.isIgnoredDocPath(docPath));
+    const pendingLocalDeletions = [...this.pendingLocalDeletions]
+      .filter(([docPath]) => !this.isIgnoredDocPath(docPath))
+      .map(([docPath, hash]) => ({
+        docPath,
+        hash,
+      }));
+    const knownLocalPaths = [...this.knownLocalPaths].filter((docPath) => !this.isIgnoredDocPath(docPath));
+
     if (
-      this.pendingRemoteDownloads.size === 0 &&
-      this.pendingRemoteDeletes.size === 0 &&
-      this.pendingLocalUpserts.size === 0 &&
-      this.pendingLocalDeletions.size === 0 &&
-      this.knownLocalPaths.size === 0
+      pendingRemoteDownloads.length === 0 &&
+      pendingRemoteDeletes.length === 0 &&
+      pendingLocalUpserts.length === 0 &&
+      pendingLocalDeletions.length === 0 &&
+      knownLocalPaths.length === 0
     ) {
       return null;
     }
     return {
       vaultId: this.runtimeStateKey,
-      pendingRemoteDownloads: [...this.pendingRemoteDownloads].map(([docPath, ref]) => ({
-        docPath,
-        hash: ref.hash,
-      })),
-      pendingRemoteDeletes: [...this.pendingRemoteDeletes],
-      pendingLocalUpserts: [...this.pendingLocalUpserts],
-      pendingLocalDeletions: [...this.pendingLocalDeletions].map(([docPath, hash]) => ({
-        docPath,
-        hash,
-      })),
-      knownLocalPaths: [...this.knownLocalPaths],
+      pendingRemoteDownloads,
+      pendingRemoteDeletes,
+      pendingLocalUpserts,
+      pendingLocalDeletions,
+      knownLocalPaths,
       localPath: this.localPath,
       updatedAt: new Date().toISOString(),
     };

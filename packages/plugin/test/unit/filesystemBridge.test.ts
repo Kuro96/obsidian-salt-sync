@@ -4,7 +4,7 @@ import { MockVault } from '../mocks/obsidian';
 import { ObsidianFilesystemBridge } from '../../src/sync/filesystemBridge';
 import type { Vault } from 'obsidian';
 
-function setup(options?: { isBindingHealthy?: (vaultPath: string) => boolean }) {
+function setup(options?: { isBindingHealthy?: (vaultPath: string) => boolean; isIgnoredPath?: (docPath: string) => boolean }) {
   const ydoc = new Y.Doc();
   const ytextByPath = new Map<string, Y.Text>();
   const getYText = (docPath: string): Y.Text | null => ytextByPath.get(docPath) ?? null;
@@ -18,6 +18,9 @@ function setup(options?: { isBindingHealthy?: (vaultPath: string) => boolean }) 
     undefined,
     undefined,
     options?.isBindingHealthy,
+    undefined,
+    undefined,
+    options?.isIgnoredPath,
   );
   return { ydoc, vault, bridge, ytextByPath };
 }
@@ -50,6 +53,28 @@ describe('ObsidianFilesystemBridge', () => {
     // Non-matching content is not suppressed
     bridge.suppressExpectedWrite('note.md', { sha256: 'x', byteLength: 1 });
     expect(bridge.isSuppressed('note.md', 'something-else')).toBe(false);
+  });
+
+  it('does not flush ignored doc paths from remote transactions', async () => {
+    const { bridge, vault, ydoc } = setup({ isIgnoredPath: (docPath) => docPath.startsWith('~syncthing~') });
+    const docs = ydoc.getMap<Y.Text>('docs');
+    const idToPath = ydoc.getMap<string>('idToPath');
+    let remoteTxn: Y.Transaction | null = null;
+    ydoc.on('afterTransaction', (txn) => {
+      if (txn.origin === 'remote') remoteTxn = txn;
+    });
+
+    ydoc.transact(() => {
+      const ignoredText = new Y.Text();
+      ignoredText.insert(0, 'ignored content');
+      docs.set('ignored-file', ignoredText);
+      idToPath.set('ignored-file', '~syncthing~note.md.tmp');
+    }, 'remote');
+
+    bridge.handleRemoteTransaction(remoteTxn!, docs, idToPath, ['ignored-file']);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(vault.getFileByPath('~syncthing~note.md.tmp')).toBeNull();
   });
 
   it('deleteFile removes the file and flags expectedDelete', async () => {

@@ -26,6 +26,16 @@ interface TokenMutationBody {
   status?: unknown;
 }
 
+interface IgnoredPathCleanupBody {
+  dryRun?: unknown;
+  confirmVaultId?: unknown;
+  confirmText?: unknown;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(body));
@@ -239,6 +249,12 @@ export class AdminApiRouter {
         return true;
       }
 
+      const ignoredCleanupMatch = pathname.match(/^\/admin\/api\/vaults\/([^/]+)\/ignored-paths\/cleanup$/);
+      if (ignoredCleanupMatch && req.method === 'POST') {
+        await this.handleIgnoredPathCleanup(req, res, decodeURIComponent(ignoredCleanupMatch[1]));
+        return true;
+      }
+
       sendJson(res, 404, { error: 'not_found' });
       return true;
     } catch (err) {
@@ -257,6 +273,14 @@ export class AdminApiRouter {
       }
       if (err instanceof Error && /^(name_required|name_must_be_string|note_must_be_string|expiresAt_must_be_string|expiresAt_invalid|status_invalid)$/.test(err.message)) {
         sendJson(res, errorStatus(err.message), { error: err.message });
+        return true;
+      }
+      if (err instanceof Error && /^(confirm_vault_id_required|confirm_text_required|dryRun_must_be_boolean)$/.test(err.message)) {
+        sendJson(res, errorStatus(err.message), { error: err.message });
+        return true;
+      }
+      if (err instanceof Error && err.message === 'body_must_be_object') {
+        sendJson(res, 400, { error: err.message });
         return true;
       }
       sendJson(res, 500, { error: 'internal_error' });
@@ -547,6 +571,34 @@ export class AdminApiRouter {
       kept: liveHashes.size,
       skippedTooNew,
     });
+  }
+
+  private async handleIgnoredPathCleanup(req: IncomingMessage, res: ServerResponse, vaultId: string): Promise<void> {
+    const rawBody = await readJsonBody(req);
+    if (!isRecord(rawBody)) {
+      throw new Error('body_must_be_object');
+    }
+    const body = rawBody as IgnoredPathCleanupBody;
+    if (body.dryRun !== undefined && typeof body.dryRun !== 'boolean') {
+      throw new Error('dryRun_must_be_boolean');
+    }
+
+    const dryRun = body.dryRun !== false;
+    const room = await this.deps.roomManager.getOrCreate(vaultId);
+
+    if (dryRun) {
+      sendJson(res, 200, await room.inspectIgnoredPathPollution());
+      return;
+    }
+
+    if (body.confirmVaultId !== vaultId) {
+      throw new Error('confirm_vault_id_required');
+    }
+    if (body.confirmText !== 'cleanup ignored paths') {
+      throw new Error('confirm_text_required');
+    }
+
+    sendJson(res, 200, await room.cleanupIgnoredPathPollution());
   }
 
   private streamZip(
