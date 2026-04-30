@@ -353,35 +353,18 @@ private async flushCacheSave(): Promise<void> {
 
 ### 4.6 修复 3.6：Tombstone GC
 
-**方案**: 在 reconcile 成功后，清理已确认双方收敛的 tombstone。
+**结论**: 当前协议不能安全实现基于时间的 tombstone GC。GC 必须等到系统能证明所有仍被支持的设备都已观察到删除后才能删除共享 tombstone。
 
-策略：tombstone 在**所有设备都确认**后才能安全删除。简单实现为基于时间的 TTL：
+不能使用 TTL 的原因：如果设备离线超过 TTL，重连时服务端已经删除 tombstone，该设备仍可能带着本地旧文件和旧缓存完成同步；由于 tombstone guard 不存在，reconcile 会把旧文件重新导入或重新上传，复活已删除数据。
 
-```typescript
-private gcStaleTombstones(maxAgeMs: number = 7 * 24 * 60 * 60 * 1000): void {
-  const now = Date.now();
-  const gcCandidates: string[] = [];
+安全 GC 的前置条件：
 
-  for (const [docPath, tombstone] of this.fileTombstones) {
-    const deletedAt = new Date(tombstone.deletedAt).getTime();
-    if (now - deletedAt > maxAgeMs) {
-      gcCandidates.push(docPath);
-    }
-  }
+1. 设备注册表：服务端或共享模型需要记录已知 `deviceId`，并区分活跃、退役、超期不再支持的设备。
+2. Tombstone ack：每个设备完成初始同步和本地删除副作用后，持久记录“已观察到 tombstone X”。
+3. GC 判定：只有当 tombstone 的 `ackedBy` 覆盖全部活跃设备，或未 ack 设备已显式退役/超过产品定义的离线支持窗口，才允许删除 tombstone。
+4. GC 原子性：删除 tombstone 的事务必须保留底层 `pathToId`/`pathToBlob` 删除结果，并不能被长离线设备的本地磁盘文件重新解释为新建。
 
-  if (gcCandidates.length === 0) return;
-
-  this.ydoc.transact(() => {
-    for (const docPath of gcCandidates) {
-      this.fileTombstones.delete(docPath);
-    }
-  }, 'gc');
-
-  console.log(`[VaultSync] GC'd ${gcCandidates.length} stale tombstones`);
-}
-```
-
-在 `reconcile()` 末尾和定时任务（如 `blobRescanTimer` 同频）中调用。Blob tombstone 同理。
+本轮实现保持 tombstone 不自动 GC；同名文件重建、snapshot restore 等已有路径仍可显式清除对应 tombstone。后续若引入设备 ack，需要同步更新 shared protocol、server persistence、plugin reconcile 和迁移测试。
 
 ### 4.7 修复 3.7：Blob tombstone 增加 startup-baseline 分类
 
@@ -431,7 +414,7 @@ async openRemoteApplyGate(): Promise<void> {
 | P1 | 3.5 Markdown pending 不持久化 | 4.5 IndexedDB | 中 | 崩溃后删除意图丢失 |
 | P1 | 3.7 Blob tombstone 无分类 | 4.7 deferred set | 中 | 启动阶段 blob 误删 |
 | P2 | 3.3 ReadOnly pending 滞留 | 4.4 防御性清空 | 低 | 内存泄漏 |
-| P2 | 3.6 Tombstone 无 GC | 4.6 TTL GC | 中 | 长期膨胀 |
+| P2 | 3.6 Tombstone 无 GC | 4.6 ack-gated GC（暂不实现 TTL） | 高 | 长期膨胀 |
 | P3 | 3.4 Blob 回声抑制 | — | 低 | 重复 tombstone |
 | P3 | 3.8 Provenance 命名混淆 | 改名 | 低 | 可维护性 |
 
@@ -463,7 +446,7 @@ async openRemoteApplyGate(): Promise<void> {
 **目标**: 控制资源增长，修复边缘场景。
 
 7. **4.4** — reconcileReadOnly 防御性清空
-8. **4.6** — Tombstone TTL GC
+8. **4.6** — 设计 ack-gated Tombstone GC；在缺少 ack 前不启用自动 GC
 9. **3.8** — 修正 provenance 命名
 
 ## 7. 测试策略
@@ -502,5 +485,5 @@ twoEngine.test.ts:
 |------|----------|
 | Gate guard 导致合法 pending 永远不 flush | reconcile 阶段的 flush 带 localDocPaths，是 pending 的最终出口 |
 | isDeletedPath 回调增加 bridge 耦合 | 回调是可选的（`?.`），不影响现有测试 |
-| Tombstone GC 删除仍在传播中的 tombstone | 7 天 TTL 足够覆盖任何合理的离线窗口 |
+| Tombstone GC 删除仍在传播中的 tombstone | 不使用年龄 TTL；必须等设备 ack/退役机制可证明删除已被所有受支持设备观察 |
 | Markdown pending 持久化增加 cache 大小 | pending 通常很小（< 100 条），可忽略 |

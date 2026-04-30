@@ -697,35 +697,7 @@ export class VaultSyncEngine implements SyncEngine {
       if (!this.knownLocalMarkdownPaths.has(docPath)) continue;
       this.handleLocalFileDeletion(docPath);
     }
-    this.gcStaleTombstones();
     console.log(`[VaultSync] reconcile — ${files.length} files (${this.mount?.localPath ?? 'primary'})`);
-  }
-
-  /**
-   * Remove tombstones older than `maxAgeMs` (default 7 days).
-   * Once a tombstone has been synced to all devices it serves no further
-   * purpose; keeping it around inflates the Y.Doc and slows down sync.
-   */
-  private gcStaleTombstones(maxAgeMs: number = 7 * 24 * 60 * 60 * 1000): void {
-    const now = Date.now();
-    const mdGc: string[] = [];
-    for (const [docPath, tombstone] of this.fileTombstones) {
-      if (now - new Date(tombstone.deletedAt).getTime() > maxAgeMs) {
-        mdGc.push(docPath);
-      }
-    }
-    const blobGc: string[] = [];
-    for (const [docPath, tombstone] of this.blobTombstones) {
-      if (now - new Date(tombstone.deletedAt).getTime() > maxAgeMs) {
-        blobGc.push(docPath);
-      }
-    }
-    if (mdGc.length === 0 && blobGc.length === 0) return;
-    this.ydoc.transact(() => {
-      for (const p of mdGc) this.fileTombstones.delete(p);
-      for (const p of blobGc) this.blobTombstones.delete(p);
-    }, 'gc');
-    console.log(`[VaultSync] GC'd ${mdGc.length} markdown + ${blobGc.length} blob stale tombstones`);
   }
 
   async handleLocalFileChange(vaultPath: string): Promise<void> {

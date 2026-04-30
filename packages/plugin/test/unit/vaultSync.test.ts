@@ -932,12 +932,11 @@ describe('VaultSyncEngine', () => {
       expect(pendingLocalMarkdownDeletions.size).toBe(0);
     });
 
-    it('gcStaleTombstones removes entries older than TTL', async () => {
+    it('preserves old tombstones because age alone cannot prove all devices observed deletes', async () => {
       const engine = setupForReconcile([]);
       const { ydoc, tombstones } = internals(engine);
       const blobTombstones = ydoc.getMap('blobTombstones') as Y.Map<{ hash: string; deletedAt: string }>;
 
-      // Create tombstones: one old (8 days), one recent (1 hour)
       const oldDate = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
       const recentDate = new Date(Date.now() - 60 * 60 * 1000).toISOString();
       ydoc.transact(() => {
@@ -949,9 +948,9 @@ describe('VaultSyncEngine', () => {
 
       await engine.reconcile();
 
-      expect(tombstones.has('old.md')).toBe(false);
+      expect(tombstones.has('old.md')).toBe(true);
       expect(tombstones.has('recent.md')).toBe(true);
-      expect(blobTombstones.has('old.png')).toBe(false);
+      expect(blobTombstones.has('old.png')).toBe(true);
       expect(blobTombstones.has('recent.png')).toBe(true);
     });
 
