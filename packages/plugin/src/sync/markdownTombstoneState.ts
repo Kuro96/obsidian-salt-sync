@@ -90,15 +90,15 @@ export class MarkdownTombstoneState {
     }
 
     for (const [path, tombstone] of finalChanges) {
-      if (receipt.origin === 'local' || receipt.origin === 'self') {
-        if (tombstone !== undefined && !this.entries.has(path)) {
-          this.entries.set(path, { kind: 'ignored-local', receiptEpoch: this.epoch });
-        }
+      if (tombstone === undefined) {
+        this.entries.delete(path);
         continue;
       }
 
-      if (tombstone === undefined) {
-        this.entries.delete(path);
+      if (receipt.origin === 'local' || receipt.origin === 'self') {
+        if (!this.entries.has(path)) {
+          this.entries.set(path, { kind: 'ignored-local', receiptEpoch: this.epoch });
+        }
         continue;
       }
 

@@ -2,10 +2,18 @@ import { openDB, type IDBPDatabase } from 'idb';
 import type { LocalCache, LocalCacheState, VaultId } from '@salt-sync/shared';
 
 const DB_NAME = 'salt-sync';
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 const STORE_NAME = 'local-cache';
 const BLOB_RUNTIME_STORE_NAME = 'blob-runtime-state';
 const DEVICE_META_STORE_NAME = 'device-meta';
+const MARKDOWN_PENDING_STORE_NAME = 'markdown-pending-state';
+
+export interface MarkdownPendingState {
+  vaultId: VaultId;
+  pendingLocalDeletions: string[];
+  localPath?: string;
+  updatedAt: string;
+}
 
 export interface BlobRuntimeState {
   vaultId: VaultId;
@@ -40,6 +48,9 @@ async function getDb(): Promise<IDBPDatabase> {
       }
       if (!db.objectStoreNames.contains(DEVICE_META_STORE_NAME)) {
         db.createObjectStore(DEVICE_META_STORE_NAME);
+      }
+      if (!db.objectStoreNames.contains(MARKDOWN_PENDING_STORE_NAME)) {
+        db.createObjectStore(MARKDOWN_PENDING_STORE_NAME, { keyPath: 'vaultId' });
       }
     },
   });
@@ -97,6 +108,24 @@ export class IndexedDbLocalCache implements LocalCache {
     if (!raw) return false;
     await db.delete(STORE_NAME, legacyVaultId);
     return true;
+  }
+}
+
+export class IndexedDbMarkdownPendingStore {
+  async load(vaultId: VaultId): Promise<MarkdownPendingState | null> {
+    const db = await getDb();
+    const raw = await db.get(MARKDOWN_PENDING_STORE_NAME, vaultId) as MarkdownPendingState | undefined;
+    return raw ?? null;
+  }
+
+  async save(vaultId: VaultId, state: MarkdownPendingState): Promise<void> {
+    const db = await getDb();
+    await db.put(MARKDOWN_PENDING_STORE_NAME, { ...state, vaultId });
+  }
+
+  async clear(vaultId: VaultId): Promise<void> {
+    const db = await getDb();
+    await db.delete(MARKDOWN_PENDING_STORE_NAME, vaultId);
   }
 }
 

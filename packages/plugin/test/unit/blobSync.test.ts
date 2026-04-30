@@ -1861,4 +1861,5 @@ describe('BlobSync localPath guard (Bug 2: mount path change)', () => {
     const blobTombstones = ydoc.getMap('blobTombstones') as Y.Map<{ hash: string }>;
     expect(blobTombstones.get('assets/note.png')?.hash).toBe(hash);
   });
+
 });

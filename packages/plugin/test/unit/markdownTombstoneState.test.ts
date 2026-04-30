@@ -189,6 +189,25 @@ describe('MarkdownTombstoneState', () => {
     expect(state.getDecision('live.md')).toMatchObject({ kind: 'absent' });
   });
 
+  it('clears existing remote replay candidates when a local transaction removes the tombstone', () => {
+    const state = new MarkdownTombstoneState();
+
+    state.applyTransaction([
+      { path: 'restored.md', tombstone: tombstone(10) },
+    ], receipt({ provenance: 'startup-maintenance' }));
+    expect(state.getReplayDecisions()).toEqual([
+      { path: 'restored.md', kind: 'live-delete' },
+    ]);
+
+    state.applyTransaction([
+      { path: 'restored.md', tombstone: undefined },
+    ], receipt({ provenance: 'open', origin: 'local' }));
+
+    expect(state.getPendingPaths()).toEqual({ baseline: [], live: [] });
+    expect(state.getReplayDecisions()).toEqual([]);
+    expect(state.getDecision('restored.md')).toMatchObject({ kind: 'absent' });
+  });
+
   it('treats removal followed by re-add as a fresh candidate regardless of deletedAt ordering', () => {
     const state = new MarkdownTombstoneState();
 
