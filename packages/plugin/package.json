@@ -1,6 +1,6 @@
 {
   "name": "@salt-sync/plugin",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "private": true,
   "scripts": {
     "build": "esbuild src/main.ts --bundle --outfile=dist/main.js --external:obsidian --external:electron --external:@codemirror/autocomplete --external:@codemirror/collab --external:@codemirror/commands --external:@codemirror/language --external:@codemirror/lint --external:@codemirror/search --external:@codemirror/state --external:@codemirror/view --external:@lezer/common --external:@lezer/highlight --external:@lezer/lr --platform=node --target=node16 --jsx=automatic --log-level=info",
