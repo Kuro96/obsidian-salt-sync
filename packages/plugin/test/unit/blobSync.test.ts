@@ -970,8 +970,8 @@ describe('BlobSync reconcile', () => {
       pendingRemoteDownloads: [],
       pendingRemoteDeletes: [],
       pendingLocalUpserts: [],
-      pendingLocalDeletions: [{ docPath: '未命名', hash: null }],
-      knownLocalPaths: ['未命名'],
+      pendingLocalDeletions: [{ docPath: 'assets/orphan.png', hash: null }],
+      knownLocalPaths: ['assets/orphan.png'],
       updatedAt: new Date().toISOString(),
     });
 
@@ -990,7 +990,7 @@ describe('BlobSync reconcile', () => {
     );
 
     await sync.restoreRuntimeState();
-    expect(sync.getPendingBlobItems()).toEqual([{ kind: 'local-delete', path: '未命名', hash: null }]);
+    expect(sync.getPendingBlobItems()).toEqual([{ kind: 'local-delete', path: 'assets/orphan.png', hash: null }]);
 
     await sync.reconcile('authoritative');
     await sync.flushPersistChain();
