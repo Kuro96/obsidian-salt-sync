@@ -7,6 +7,7 @@ import type { Plugin } from 'obsidian';
 import type { SaltSyncSettings } from '../../src/settings';
 import type { SharedDirectoryMount, FileTombstone } from '@salt-sync/shared';
 import { MockPlugin, MockVault, TFile } from '../mocks/obsidian';
+import { UserIgnoreMatcher } from '../../src/sync/userIgnore';
 
 function baseSettings(): SaltSyncSettings {
   return {
@@ -15,6 +16,7 @@ function baseSettings(): SaltSyncSettings {
     token: 'dev',
     deviceId: 'dev1',
     deviceName: 'test',
+    vaultSyncEnabled: false,
     sharedMounts: [],
   };
 }
@@ -98,6 +100,20 @@ describe('VaultSyncEngine', () => {
       expect(engine.isPathForThisEngine('notes/foo.sync-conflict-20260428.md')).toBe(false);
       expect(engine.isPathForThisEngine('notes/~syncthing~foo.md.tmp')).toBe(false);
       expect(engine.isPathForThisEngine('notes/draft.tmp')).toBe(true);
+    });
+
+    it('applies configured ignore file rules to engine path filtering', async () => {
+      const vault = new MockVault();
+      vault.seedText('.salt-sync-ignore', 'private/**\n*.draft.md');
+      const engine = new VaultSyncEngine(fakePlugin(), baseSettings(), null);
+      (engine as unknown as { userIgnoreMatcher: UserIgnoreMatcher }).userIgnoreMatcher = await UserIgnoreMatcher.load(
+        vault as never,
+        '.salt-sync-ignore',
+      );
+
+      expect(engine.isPathForThisEngine('private/secret.md')).toBe(false);
+      expect(engine.isPathForThisEngine('notes/day.draft.md')).toBe(false);
+      expect(engine.isPathForThisEngine('notes/day.md')).toBe(true);
     });
   });
 
@@ -1787,7 +1803,7 @@ describe('VaultSyncEngine', () => {
           updatePathsAfterRename: () => void;
           isHealthyBinding: () => boolean;
         };
-        awareness: { destroy: () => void; on: () => void };
+        awareness: { destroy: () => void; on: () => void; setLocalStateField: () => void };
         cache: {
           clearLegacyVaultOnlyKey: () => Promise<boolean>;
           load: () => Promise<null>;
@@ -1973,7 +1989,7 @@ describe('VaultSyncEngine', () => {
       const payload = Y.encodeStateAsUpdate(snapDoc);
       const fetchMock = vi.mocked(fetch);
       fetchMock.mockResolvedValue(
-        new Response(payload, { status: 200, headers: { 'Content-Type': 'application/octet-stream' } }),
+        new Response(payload as BodyInit, { status: 200, headers: { 'Content-Type': 'application/octet-stream' } }),
       );
 
       await engine.restoreSnapshot('snap-1');

@@ -1,3 +1,5 @@
+import { isIgnoredPathSegment } from './ignoredPathRules.js';
+
 export function normalizeVaultPath(path: string): string {
   return path
     .trim()
@@ -10,11 +12,7 @@ export function normalizeVaultPath(path: string): string {
 export function isPathIgnoredBySync(vaultPath: string): boolean {
   const normalized = normalizeVaultPath(vaultPath);
   if (!normalized) return false;
-  const segments = normalized.split('/');
-  return segments.some((segment) => segment === '.obsidian' || segment === '.trash')
-    || segments.some((segment) => segment === '.stfolder' || segment === '.stversions' || segment === '.stignore')
-    || segments.some((segment) => segment.includes('.sync-conflict-'))
-    || segments.some((segment) => /^~syncthing~.*\.tmp$/i.test(segment));
+  return normalized.split('/').some(isIgnoredPathSegment);
 }
 
 export function isSameOrChildPath(path: string, parent: string): boolean {

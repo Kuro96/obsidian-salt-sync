@@ -26,6 +26,9 @@ importers:
       idb:
         specifier: ^8.0.0
         version: 8.0.3
+      ignore:
+        specifier: ^7.0.5
+        version: 7.0.5
       react:
         specifier: ^19.2.5
         version: 19.2.5
@@ -1101,6 +1104,10 @@ packages:
 
   idb@8.0.3:
     resolution: {integrity: sha512-LtwtVyVYO5BqRvcsKuB2iUMnHwPVByPCXFXOpuU96IZPPoPN6xjOGxZQ74pgSVVLQWtUOYgyeL4GE98BY5D3wg==}
+
+  ignore@7.0.5:
+    resolution: {integrity: sha512-Hs59xBNfUIunMFgWAbGX5cq6893IbWg4KnrjbYwX3tx0ztorVgTDA6B2sxf8ejHJ4wz8BqGUMYlnzNBer5NvGg==}
+    engines: {node: '>= 4'}
 
   isomorphic.js@0.2.5:
     resolution: {integrity: sha512-PIeMbHqMt4DnUP3MA/Flc0HElYjMXArsw1qwJZcm9sqR8mq3l8NYizFMty0pWwE/tzIGH3EKK5+jes5mAr85yw==}
@@ -2637,6 +2644,8 @@ snapshots:
       resolve-pkg-maps: 1.0.0
 
   idb@8.0.3: {}
+
+  ignore@7.0.5: {}
 
   isomorphic.js@0.2.5: {}
 

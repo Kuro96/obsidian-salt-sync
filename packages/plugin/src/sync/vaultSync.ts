@@ -22,6 +22,7 @@ import { applyDiffToYText } from './diff';
 import { randomUUID, changedMapKeys, mapChanged } from '../util';
 import { isPathIgnoredBySync, isSameOrChildPath, normalizeVaultPath } from './pathSafety';
 import { MarkdownTombstoneState, type TombstoneReceiptOrigin, type TombstoneReceiptProvenance } from './markdownTombstoneState';
+import { UserIgnoreMatcher } from './userIgnore';
 
 // ── Sync status types ─────────────────────────────────────────────────────────
 
@@ -119,6 +120,7 @@ export class VaultSyncEngine implements SyncEngine {
   private statusHandlers: Array<(status: SyncStatus) => void> = [];
   /** Remote path deletions and their previous file IDs, captured from Y.MapEvent before afterTransaction runs. */
   private readonly remotePathRemovalFileIds = new WeakMap<Y.Transaction, Map<string, string>>();
+  private userIgnoreMatcher = UserIgnoreMatcher.disabled();
 
   /** Effective settings for this engine (may differ from plugin settings for mounts) */
   private readonly effectiveSettings: SaltSyncSettings;
@@ -200,7 +202,7 @@ export class VaultSyncEngine implements SyncEngine {
    * - 排除 Obsidian/Trash/Syncthing 内部路径和冲突文件
    */
   isPathForThisEngine(vaultPath: string): boolean {
-    if (isPathIgnoredBySync(vaultPath)) return false;
+    if (this.isIgnoredVaultPath(vaultPath)) return false;
     if (this.mount) {
       const mountPath = normalizeVaultPath(this.mount.localPath);
       return isSameOrChildPath(vaultPath, mountPath) && normalizeVaultPath(vaultPath) !== mountPath;
@@ -286,11 +288,11 @@ export class VaultSyncEngine implements SyncEngine {
 
     let totalBlobBytes = 0;
     for (const [docPath, ref] of this.pathToBlob) {
-      if (isPathIgnoredBySync(docPath)) continue;
+      if (this.isIgnoredDocPath(docPath)) continue;
       totalBlobBytes += ref.size;
     }
-    const markdownFileCount = [...this.pathToId.keys()].filter((docPath) => !isPathIgnoredBySync(docPath)).length;
-    const blobFileCount = [...this.pathToBlob.keys()].filter((docPath) => !isPathIgnoredBySync(docPath)).length;
+    const markdownFileCount = [...this.pathToId.keys()].filter((docPath) => !this.isIgnoredDocPath(docPath)).length;
+    const blobFileCount = [...this.pathToBlob.keys()].filter((docPath) => !this.isIgnoredDocPath(docPath)).length;
 
     return {
       phase,
@@ -325,6 +327,7 @@ export class VaultSyncEngine implements SyncEngine {
   async start(): Promise<void> {
     const vault = this.plugin.app.vault;
     const isReadOnly = !!this.mount?.readOnly;
+    this.userIgnoreMatcher = await UserIgnoreMatcher.load(vault, this.effectiveSettings.ignoreFilePath);
 
     this.editorBindings = new EditorBindingManager({
       awareness: this.awareness,
@@ -370,6 +373,7 @@ export class VaultSyncEngine implements SyncEngine {
       this.blobRuntimeStateStore,
       `${this.effectiveSettings.serverUrl}::${this.effectiveSettings.vaultId}`,
       this.mount?.localPath,
+      (docPath) => this.isIgnoredDocPath(docPath),
     );
     this.enterMarkdownStartupGate();
     this.blobSync.enterStartupGate();
@@ -616,7 +620,7 @@ export class VaultSyncEngine implements SyncEngine {
   private async reconcileReadOnly(): Promise<void> {
     const paths: string[] = [];
     for (const [docPath] of this.pathToId) {
-      if (isPathIgnoredBySync(docPath)) continue;
+      if (this.isIgnoredDocPath(docPath)) continue;
       if (this.fileTombstones.has(docPath)) {
         this.markdownTombstones.classifyBaseline(docPath, 'authoritative-delete');
         this.queueRemoteMarkdownDelete(docPath);
@@ -625,7 +629,7 @@ export class VaultSyncEngine implements SyncEngine {
       paths.push(docPath);
     }
     for (const docPath of this.fileTombstones.keys()) {
-      if (isPathIgnoredBySync(docPath)) continue;
+      if (this.isIgnoredDocPath(docPath)) continue;
       this.markdownTombstones.classifyBaseline(docPath, 'authoritative-delete');
       this.queueRemoteMarkdownDelete(docPath);
     }
@@ -690,7 +694,7 @@ export class VaultSyncEngine implements SyncEngine {
     // Materialize shared files that are absent from disk unless this session
     // has already confirmed the same path existed locally and then disappeared.
     for (const docPath of [...this.pathToId.keys()]) {
-      if (isPathIgnoredBySync(docPath)) continue;
+      if (this.isIgnoredDocPath(docPath)) continue;
       if (localDocPaths.has(docPath)) continue;
       if (this.fileTombstones.has(docPath)) continue;
       if (this.knownLocalMarkdownPaths.has(docPath)) continue; // missing from disk → tombstone loop
@@ -704,7 +708,7 @@ export class VaultSyncEngine implements SyncEngine {
     // Detect paths this session has confirmed locally, then later found absent.
     // Only those in-session misses are treated as local deletions.
     for (const docPath of [...this.pathToId.keys()]) {
-      if (isPathIgnoredBySync(docPath)) continue;
+      if (this.isIgnoredDocPath(docPath)) continue;
       if (localDocPaths.has(docPath)) continue;
       if (this.fileTombstones.has(docPath)) continue;
       if (!this.knownLocalMarkdownPaths.has(docPath)) continue;
@@ -908,7 +912,7 @@ export class VaultSyncEngine implements SyncEngine {
 
     this.ydoc.transact(() => {
       for (const [docPath, fileId] of this.pathToId) {
-        if (isPathIgnoredBySync(docPath)) continue;
+        if (this.isIgnoredDocPath(docPath)) continue;
         if (snapPathToId.has(docPath)) continue;
         this.pathToId.delete(docPath);
         this.idToPath.delete(fileId);
@@ -918,7 +922,7 @@ export class VaultSyncEngine implements SyncEngine {
       }
 
       for (const [docPath, fileId] of snapPathToId) {
-        if (isPathIgnoredBySync(docPath)) continue;
+        if (this.isIgnoredDocPath(docPath)) continue;
         const snapText = snapDocs.get(fileId);
         if (!snapText) continue;
 
@@ -938,14 +942,14 @@ export class VaultSyncEngine implements SyncEngine {
       }
 
       for (const [docPath, tombstone] of snapFileTombstones) {
-        if (isPathIgnoredBySync(docPath)) continue;
+        if (this.isIgnoredDocPath(docPath)) continue;
         if (snapPathToId.has(docPath)) continue;
         this.fileTombstones.set(docPath, tombstone);
         removedMarkdownPaths.add(docPath);
       }
 
       for (const [docPath, ref] of this.pathToBlob) {
-        if (isPathIgnoredBySync(docPath)) continue;
+        if (this.isIgnoredDocPath(docPath)) continue;
         if (snapPathToBlob.has(docPath)) continue;
         this.pathToBlob.delete(docPath);
         this.blobTombstones.set(docPath, { hash: ref.hash, deletedAt });
@@ -953,14 +957,14 @@ export class VaultSyncEngine implements SyncEngine {
       }
 
       for (const [docPath, ref] of snapPathToBlob) {
-        if (isPathIgnoredBySync(docPath)) continue;
+        if (this.isIgnoredDocPath(docPath)) continue;
         this.pathToBlob.set(docPath, ref);
         this.blobTombstones.delete(docPath);
         materializedBlobPaths.add(docPath);
       }
 
       for (const [docPath, tombstone] of snapBlobTombstones) {
-        if (isPathIgnoredBySync(docPath)) continue;
+        if (this.isIgnoredDocPath(docPath)) continue;
         if (snapPathToBlob.has(docPath)) continue;
         this.blobTombstones.set(docPath, tombstone);
         removedBlobPaths.add(docPath);
@@ -1038,7 +1042,7 @@ export class VaultSyncEngine implements SyncEngine {
   private async persistMarkdownPending(): Promise<void> {
     await this.markdownPendingStore.save(this.localCacheKey, {
       vaultId: this.localCacheKey,
-      pendingLocalDeletions: [...this.pendingLocalMarkdownDeletions].filter((docPath) => !isPathIgnoredBySync(docPath)),
+      pendingLocalDeletions: [...this.pendingLocalMarkdownDeletions].filter((docPath) => !this.isIgnoredDocPath(docPath)),
       localPath: this.mount?.localPath,
       updatedAt: new Date().toISOString(),
     });
@@ -1050,7 +1054,7 @@ export class VaultSyncEngine implements SyncEngine {
     if (saved.localPath !== this.mount?.localPath) return;
 
     for (const docPath of saved.pendingLocalDeletions) {
-      if (isPathIgnoredBySync(docPath)) continue;
+      if (this.isIgnoredDocPath(docPath)) continue;
       if (this.pendingLocalMarkdownDeletions.has(docPath)) continue;
       // File has reappeared on disk → user likely undid the delete
       if (this.plugin.app.vault.getAbstractFileByPath(this.toVaultPath(docPath))) continue;
@@ -1080,7 +1084,7 @@ export class VaultSyncEngine implements SyncEngine {
   }
 
   private queueRemoteMarkdownDelete(docPath: string): void {
-    if (isPathIgnoredBySync(docPath)) return;
+    if (this.isIgnoredDocPath(docPath)) return;
     this.pendingRemoteMarkdownDeletes.add(docPath);
   }
 
@@ -1091,11 +1095,11 @@ export class VaultSyncEngine implements SyncEngine {
     // intent does not wait for another remote transaction.
     await this.convergePendingLocalMarkdownDeletions();
     for (const decision of this.markdownTombstones.getReplayDecisions()) {
-      if (isPathIgnoredBySync(decision.path)) continue;
+      if (this.isIgnoredDocPath(decision.path)) continue;
       this.queueRemoteMarkdownDelete(decision.path);
     }
     for (const docPath of this.fileTombstones.keys()) {
-      if (isPathIgnoredBySync(docPath)) continue;
+      if (this.isIgnoredDocPath(docPath)) continue;
       if (this.markdownTombstones.getDecision(docPath).kind === 'absent') {
         this.queueRemoteMarkdownDelete(docPath);
       }
@@ -1110,7 +1114,7 @@ export class VaultSyncEngine implements SyncEngine {
     const changes = changedMapKeys(txn, tombMap).map((path) => ({
       path,
       tombstone: tombMap.get(path),
-    })).filter((change) => !isPathIgnoredBySync(change.path));
+    })).filter((change) => !this.isIgnoredDocPath(change.path));
     if (changes.length === 0) return;
     const origin = this.getTombstoneReceiptOrigin(txn.origin);
     const provenance = this.getTombstoneReceiptProvenance(origin);
@@ -1187,7 +1191,7 @@ export class VaultSyncEngine implements SyncEngine {
     const tombMap = this.fileTombstones;
     if (mapChanged(txn, tombMap)) {
       for (const docPath of changedMapKeys(txn, tombMap)) {
-        if (isPathIgnoredBySync(docPath)) continue;
+        if (this.isIgnoredDocPath(docPath)) continue;
         if (tombMap.has(docPath)) {
           const decision = this.markdownTombstones.getDecision(docPath);
           const replayable = decision.replayable;
@@ -1243,8 +1247,12 @@ export class VaultSyncEngine implements SyncEngine {
     return leaves.map((leaf) => leaf.view).filter((view): view is MarkdownView => !!view && !!view.file);
   }
 
+  private isIgnoredVaultPath(vaultPath: string): boolean {
+    return isPathIgnoredBySync(vaultPath) || this.userIgnoreMatcher.matchesVaultPath(vaultPath);
+  }
+
   private isIgnoredDocPath(docPath: string): boolean {
-    return isPathIgnoredBySync(docPath) || isPathIgnoredBySync(this.toVaultPath(docPath));
+    return isPathIgnoredBySync(docPath) || this.isIgnoredVaultPath(this.toVaultPath(docPath));
   }
 
   private bindAllOpenEditors(): void {

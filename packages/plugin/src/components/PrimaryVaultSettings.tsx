@@ -26,12 +26,17 @@ function SettingItem({
   );
 }
 
+function normalizeIgnoreFilePath(value: string): string {
+  return value.trim().replace(/\\/g, '/').replace(/^\.\/+/g, '');
+}
+
 export function PrimaryVaultSettings({ plugin }: { plugin: SaltSyncPlugin }) {
   const [vaultSyncEnabled, setVaultSyncEnabled] = useState(plugin.settings.vaultSyncEnabled);
   const [serverUrl, setServerUrl] = useState(plugin.settings.serverUrl);
   const [vaultId, setVaultId] = useState(plugin.settings.vaultId);
   const [token, setToken] = useState(plugin.settings.token);
   const [deviceName, setDeviceName] = useState(plugin.settings.deviceName);
+  const [ignoreFilePath, setIgnoreFilePath] = useState(plugin.settings.ignoreFilePath ?? '');
   const primaryStatus = useSyncStatus(plugin, 'primary');
 
   return (
@@ -134,6 +139,29 @@ export function PrimaryVaultSettings({ plugin }: { plugin: SaltSyncPlugin }) {
           onBlur={async () => {
             plugin.settings.deviceName = deviceName.trim();
             await plugin.saveSettings();
+          }}
+        />
+      </SettingItem>
+
+      <SettingItem
+        name="可选忽略文件"
+        description="语法遵循 .gitignore；留空时不启用额外忽略规则"
+      >
+        <input
+          type="text"
+          placeholder="例如 .salt-sync-ignore"
+          value={ignoreFilePath}
+          onChange={(e) => setIgnoreFilePath(e.target.value)}
+          onBlur={async () => {
+            const nextIgnoreFilePath = normalizeIgnoreFilePath(ignoreFilePath);
+            const currentIgnoreFilePath = plugin.settings.ignoreFilePath ?? '';
+
+            setIgnoreFilePath(nextIgnoreFilePath);
+            if (nextIgnoreFilePath === currentIgnoreFilePath) return;
+
+            plugin.settings.ignoreFilePath = nextIgnoreFilePath;
+            await plugin.saveSettings();
+            await plugin.refreshSync();
           }}
         />
       </SettingItem>

@@ -108,6 +108,7 @@ export class BlobSync {
     private readonly runtimeStateKey: VaultId = vaultId,
     /** 共享目录的本地挂载路径（主 vault 为 undefined）。用于检测路径切换后跳过失效的 knownLocalPaths。 */
     private readonly localPath?: string,
+    private readonly isIgnoredPath: (docPath: string) => boolean = (docPath) => isPathIgnoredBySync(docPath),
   ) {
     this.httpBase = wsUrlToHttpUrl(wsUrl);
     this.toVaultPath = toVaultPath;
@@ -419,7 +420,7 @@ export class BlobSync {
   // ── private ───────────────────────────────────────────────────────────────
 
   private isIgnoredDocPath(docPath: string): boolean {
-    return isPathIgnoredBySync(docPath) || isPathIgnoredBySync(this.toVaultPath(docPath));
+    return this.isIgnoredPath(docPath) || isPathIgnoredBySync(docPath) || isPathIgnoredBySync(this.toVaultPath(docPath));
   }
 
   private async uploadIfNeeded(
@@ -508,7 +509,7 @@ export class BlobSync {
   }
 
   private listLocalBlobFiles(): TFile[] {
-    return this.vault.getFiles().filter((file) => this.isPathForThisEngine(file.path) && !isPathIgnoredBySync(file.path) && !file.path.endsWith('.md'));
+    return this.vault.getFiles().filter((file) => this.isPathForThisEngine(file.path) && !this.isIgnoredDocPath(this.toDocPath(file.path)) && !file.path.endsWith('.md'));
   }
 
   private async readLocalBlobSnapshot(docPath: string): Promise<{
