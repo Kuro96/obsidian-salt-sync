@@ -56,6 +56,15 @@ describe('VaultSyncEngine', () => {
     vi.unstubAllGlobals();
   });
 
+  describe('lifecycle', () => {
+    it('stop is safe before start finishes initialization', async () => {
+      const engine = new VaultSyncEngine(fakePlugin(), baseSettings(), null);
+
+      await expect(engine.stop()).resolves.toBeUndefined();
+      await expect(engine.stop()).resolves.toBeUndefined();
+    });
+  });
+
   describe('isPathForThisEngine', () => {
     it('primary engine accepts top-level paths, rejects excluded mount prefixes', () => {
       const engine = new VaultSyncEngine(fakePlugin(), baseSettings(), null, ['Shared']);

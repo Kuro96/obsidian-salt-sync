@@ -13,6 +13,7 @@ import { DiffPreviewModal } from './ui/diffPreviewModal';
 export default class SaltSyncPlugin extends Plugin {
   settings!: SaltSyncSettings;
   private manager: SyncManager | null = null;
+  private syncLifecycle = Promise.resolve();
   /**
    * Plugin 层的状态订阅注册表。
    * key: 调用方传入的 handler；value: 当前 manager 返回的注销函数。
@@ -118,6 +119,10 @@ export default class SaltSyncPlugin extends Plugin {
   }
 
   async startSync(): Promise<void> {
+    return this.enqueueSyncLifecycle(() => this.startSyncNow());
+  }
+
+  private async startSyncNow(): Promise<void> {
     const enabledMounts = (this.settings.sharedMounts ?? []).filter((mount) => mount.enabled);
     const needsDefaultServerUrl = this.settings.vaultSyncEnabled || enabledMounts.some((mount) => !mount.serverUrl?.trim());
 
@@ -139,9 +144,10 @@ export default class SaltSyncPlugin extends Plugin {
       return;
     }
 
-    this.manager = new SyncManager(this, this.settings);
+    const manager = new SyncManager(this, this.settings);
+    this.manager = manager;
     try {
-      const result = await this.manager.start();
+      const result = await manager.start();
 
       if (result.primaryError) {
         console.error('[salt-sync] primary sync start error:', result.primaryError);
@@ -165,8 +171,8 @@ export default class SaltSyncPlugin extends Plugin {
       }
 
       if (!result.primaryStarted && result.startedMountCount === 0) {
-        await this.manager.stop().catch(console.error);
-        this.manager = null;
+        await manager.stop().catch(console.error);
+        if (this.manager === manager) this.manager = null;
         return;
       }
 
@@ -174,18 +180,25 @@ export default class SaltSyncPlugin extends Plugin {
 
       // 把注册表里所有已有的 handler 接到新 manager 上（manager 重建 / 订阅早于启动 两种场景）
       for (const [handler] of this.syncStatusHandlers) {
-        this.syncStatusHandlers.set(handler, this.manager.onStatusChange(handler));
+        this.syncStatusHandlers.set(handler, manager.onStatusChange(handler));
       }
     } catch (err) {
       console.error('[salt-sync] startSync error:', err);
-      this.manager = null;
+      await manager.stop().catch(console.error);
+      if (this.manager === manager) this.manager = null;
       new Notice('Salt Sync：连接失败，请查看控制台日志');
     }
   }
 
   async stopSync(): Promise<void> {
+    return this.enqueueSyncLifecycle(() => this.stopSyncNow());
+  }
+
+  private async stopSyncNow(): Promise<void> {
     if (!this.manager) return;
-    await this.manager.stop();
+    const manager = this.manager;
+    await manager.stop();
+    if (this.manager !== manager) return;
     this.manager = null;
     new Notice('Salt Sync：已断开连接');
   }
@@ -227,13 +240,21 @@ export default class SaltSyncPlugin extends Plugin {
   }
 
   async refreshSync(): Promise<void> {
-    const wasRunning = !!this.manager;
-    if (wasRunning) {
-      await this.stopSync();
-    }
-    if (this.shouldStartAnySync()) {
-      await this.startSync();
-    }
+    return this.enqueueSyncLifecycle(async () => {
+      const wasRunning = !!this.manager;
+      if (wasRunning) {
+        await this.stopSyncNow();
+      }
+      if (this.shouldStartAnySync()) {
+        await this.startSyncNow();
+      }
+    });
+  }
+
+  private enqueueSyncLifecycle(operation: () => Promise<void>): Promise<void> {
+    const next = this.syncLifecycle.then(operation, operation);
+    this.syncLifecycle = next.catch(() => {});
+    return next;
   }
 
   getSyncStatus(key: 'primary' | string): SyncStatus | null {

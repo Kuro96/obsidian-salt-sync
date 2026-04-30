@@ -591,6 +591,7 @@ export class VaultSyncEngine implements SyncEngine {
   }
 
   async stop(): Promise<void> {
+    if (this.stopped) return;
     this.stopped = true;
     if (this.healthCheckTimer) {
       clearInterval(this.healthCheckTimer);
@@ -600,9 +601,9 @@ export class VaultSyncEngine implements SyncEngine {
       clearInterval(this.blobRescanTimer);
       this.blobRescanTimer = null;
     }
-    this.editorBindings.unbindAll();
+    (this.editorBindings as EditorBindingManager | undefined)?.unbindAll();
     this.awareness.destroy();
-    await this.client.disconnect();
+    await this.client.disconnect().catch(console.error);
     await this.flushCacheSave();
     this.notifyStatusChange();
     this.statusHandlers = [];
