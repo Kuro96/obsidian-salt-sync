@@ -229,6 +229,72 @@ describe('Admin API integration', () => {
     expect(listed.tokens[0].rawToken).toBeUndefined();
     expect(listed.tokens[0].tokenHash).toBeUndefined();
   });
+
+  it('supports ignored path cleanup dry-run and confirmed apply', async () => {
+    srv = await startTestServer({ serverToken: 'admin' });
+    const room = await srv.app.roomManager.getOrCreate('vault-cleanup');
+    await room.load();
+    const ignoredText = new Y.Text();
+    ignoredText.insert(0, 'ignored');
+    room.pathToId.set('~syncthing~note.md.tmp', 'ignored-md');
+    room.idToPath.set('ignored-md', '~syncthing~note.md.tmp');
+    room.docs.set('ignored-md', ignoredText);
+    room.pathToId.set('valid.md', 'valid-md');
+    room.idToPath.set('valid-md', 'valid.md');
+
+    const dryRunRes = await fetch(`${srv.baseUrl}/admin/api/vaults/vault-cleanup/ignored-paths/cleanup`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer admin' },
+    });
+    expect(dryRunRes.status).toBe(200);
+    const dryRun = (await dryRunRes.json()) as { dryRun: boolean; counts: { pathToId: number; docs: number } };
+    expect(dryRun.dryRun).toBe(true);
+    expect(dryRun.counts.pathToId).toBe(1);
+    expect(dryRun.counts.docs).toBe(1);
+    expect(room.pathToId.has('~syncthing~note.md.tmp')).toBe(true);
+
+    const unconfirmedRes = await fetch(`${srv.baseUrl}/admin/api/vaults/vault-cleanup/ignored-paths/cleanup`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer admin', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dryRun: false, confirmVaultId: 'vault-cleanup' }),
+    });
+    expect(unconfirmedRes.status).toBe(400);
+    const unconfirmed = (await unconfirmedRes.json()) as { error: string };
+    expect(unconfirmed.error).toBe('confirm_text_required');
+    expect(room.pathToId.has('~syncthing~note.md.tmp')).toBe(true);
+
+    const applyRes = await fetch(`${srv.baseUrl}/admin/api/vaults/vault-cleanup/ignored-paths/cleanup`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer admin', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        dryRun: false,
+        confirmVaultId: 'vault-cleanup',
+        confirmText: 'cleanup ignored paths',
+      }),
+    });
+    expect(applyRes.status).toBe(200);
+    const applied = (await applyRes.json()) as { dryRun: boolean; counts: { pathToId: number } };
+    expect(applied.dryRun).toBe(false);
+    expect(applied.counts.pathToId).toBe(1);
+    expect(room.pathToId.has('~syncthing~note.md.tmp')).toBe(false);
+    expect(room.idToPath.has('ignored-md')).toBe(false);
+    expect(room.docs.has('ignored-md')).toBe(false);
+    expect(room.pathToId.has('valid.md')).toBe(true);
+  });
+
+  it('rejects non-object ignored path cleanup bodies', async () => {
+    srv = await startTestServer({ serverToken: 'admin' });
+
+    const res = await fetch(`${srv.baseUrl}/admin/api/vaults/vault-cleanup/ignored-paths/cleanup`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer admin', 'Content-Type': 'application/json' },
+      body: 'null',
+    });
+
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe('body_must_be_object');
+  });
 });
 
 skipIfNoMinio('Admin snapshot API integration', () => {
