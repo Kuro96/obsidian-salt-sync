@@ -17,7 +17,7 @@ import { IndexedDbBlobRuntimeStateStore, IndexedDbLocalCache, IndexedDbMarkdownP
 import { RoomClient } from './roomClient';
 import { EditorBindingManager } from './editorBinding';
 import { ObsidianFilesystemBridge } from './filesystemBridge';
-import { BlobSync } from './blobSync';
+import { BlobSync, type PendingBlobItem } from './blobSync';
 import { applyDiffToYText } from './diff';
 import { randomUUID, changedMapKeys, mapChanged } from '../util';
 import { isPathIgnoredBySync, isSameOrChildPath, normalizeVaultPath } from './pathSafety';
@@ -49,6 +49,8 @@ export interface SyncStatus {
   pendingBlobRemoteDeletes: number;
   /** 待传播到服务器的本地删除数量 */
   pendingBlobLocalDeletions: number;
+  /** 附件待处理明细，用于无日志环境下定位卡住路径 */
+  pendingBlobItems: PendingBlobItem[];
 }
 
 type MarkdownDeleteGateState = 'startup-blocked' | 'maintenance-blocked' | 'open';
@@ -262,6 +264,11 @@ export class VaultSyncEngine implements SyncEngine {
   // ── Status API ────────────────────────────────────────────────────────────
 
   getStatus(): SyncStatus {
+    const pendingBlobItems = this.blobSync?.getPendingBlobItems() ?? [];
+    const pendingBlobDownloads = pendingBlobItems.filter((item) => item.kind === 'download').length;
+    const pendingBlobUploads = pendingBlobItems.filter((item) => item.kind === 'upload').length;
+    const pendingBlobRemoteDeletes = pendingBlobItems.filter((item) => item.kind === 'remote-delete').length;
+    const pendingBlobLocalDeletions = pendingBlobItems.filter((item) => item.kind === 'local-delete').length;
     let phase: SyncPhase;
     if (this.clientStatus === 'failed') {
       phase = 'error';
@@ -269,33 +276,32 @@ export class VaultSyncEngine implements SyncEngine {
       phase = 'connecting';
     } else if (this.hasAuthenticated && !this.initialSyncComplete) {
       phase = 'authenticating';
-    } else if (this.initialSyncComplete && (
-      (this.blobSync?.pendingDownloadCount ?? 0) > 0 ||
-      (this.blobSync?.pendingUploadCount ?? 0) > 0 ||
-      (this.blobSync?.pendingRemoteDeleteCount ?? 0) > 0 ||
-      (this.blobSync?.pendingLocalDeletionCount ?? 0) > 0
-    )) {
+    } else if (this.initialSyncComplete && pendingBlobItems.length > 0) {
       phase = 'syncing-blobs';
-    } else if (this.initialSyncComplete && (this.blobSync?.pendingDownloadCount ?? 0) === 0) {
+    } else if (this.initialSyncComplete) {
       phase = 'synced';
     } else {
       phase = 'disconnected';
     }
 
     let totalBlobBytes = 0;
-    for (const [, ref] of this.pathToBlob) {
+    for (const [docPath, ref] of this.pathToBlob) {
+      if (isPathIgnoredBySync(docPath)) continue;
       totalBlobBytes += ref.size;
     }
+    const markdownFileCount = [...this.pathToId.keys()].filter((docPath) => !isPathIgnoredBySync(docPath)).length;
+    const blobFileCount = [...this.pathToBlob.keys()].filter((docPath) => !isPathIgnoredBySync(docPath)).length;
 
     return {
       phase,
-      markdownFileCount: this.pathToId.size,
-      blobFileCount: this.pathToBlob.size,
+      markdownFileCount,
+      blobFileCount,
       totalBlobBytes,
-      pendingBlobDownloads: this.blobSync?.pendingDownloadCount ?? 0,
-      pendingBlobUploads: this.blobSync?.pendingUploadCount ?? 0,
-      pendingBlobRemoteDeletes: this.blobSync?.pendingRemoteDeleteCount ?? 0,
-      pendingBlobLocalDeletions: this.blobSync?.pendingLocalDeletionCount ?? 0,
+      pendingBlobDownloads,
+      pendingBlobUploads,
+      pendingBlobRemoteDeletes,
+      pendingBlobLocalDeletions,
+      pendingBlobItems,
     };
   }
 
@@ -349,6 +355,7 @@ export class VaultSyncEngine implements SyncEngine {
       (vaultPath) => this.editorBindings.isHealthyBinding(vaultPath),
       (docPath) => this.handleExternalMarkdownDeletion(docPath),
       (docPath) => this.shouldBlockRemoteMarkdownFlush(docPath),
+      (docPath) => this.isIgnoredDocPath(docPath),
     );
 
     this.blobSync = new BlobSync(
@@ -608,6 +615,7 @@ export class VaultSyncEngine implements SyncEngine {
   private async reconcileReadOnly(): Promise<void> {
     const paths: string[] = [];
     for (const [docPath] of this.pathToId) {
+      if (isPathIgnoredBySync(docPath)) continue;
       if (this.fileTombstones.has(docPath)) {
         this.markdownTombstones.classifyBaseline(docPath, 'authoritative-delete');
         this.queueRemoteMarkdownDelete(docPath);
@@ -616,6 +624,7 @@ export class VaultSyncEngine implements SyncEngine {
       paths.push(docPath);
     }
     for (const docPath of this.fileTombstones.keys()) {
+      if (isPathIgnoredBySync(docPath)) continue;
       this.markdownTombstones.classifyBaseline(docPath, 'authoritative-delete');
       this.queueRemoteMarkdownDelete(docPath);
     }
@@ -680,6 +689,7 @@ export class VaultSyncEngine implements SyncEngine {
     // Materialize shared files that are absent from disk unless this session
     // has already confirmed the same path existed locally and then disappeared.
     for (const docPath of [...this.pathToId.keys()]) {
+      if (isPathIgnoredBySync(docPath)) continue;
       if (localDocPaths.has(docPath)) continue;
       if (this.fileTombstones.has(docPath)) continue;
       if (this.knownLocalMarkdownPaths.has(docPath)) continue; // missing from disk → tombstone loop
@@ -693,6 +703,7 @@ export class VaultSyncEngine implements SyncEngine {
     // Detect paths this session has confirmed locally, then later found absent.
     // Only those in-session misses are treated as local deletions.
     for (const docPath of [...this.pathToId.keys()]) {
+      if (isPathIgnoredBySync(docPath)) continue;
       if (localDocPaths.has(docPath)) continue;
       if (this.fileTombstones.has(docPath)) continue;
       if (!this.knownLocalMarkdownPaths.has(docPath)) continue;
@@ -896,6 +907,7 @@ export class VaultSyncEngine implements SyncEngine {
 
     this.ydoc.transact(() => {
       for (const [docPath, fileId] of this.pathToId) {
+        if (isPathIgnoredBySync(docPath)) continue;
         if (snapPathToId.has(docPath)) continue;
         this.pathToId.delete(docPath);
         this.idToPath.delete(fileId);
@@ -905,6 +917,7 @@ export class VaultSyncEngine implements SyncEngine {
       }
 
       for (const [docPath, fileId] of snapPathToId) {
+        if (isPathIgnoredBySync(docPath)) continue;
         const snapText = snapDocs.get(fileId);
         if (!snapText) continue;
 
@@ -924,12 +937,14 @@ export class VaultSyncEngine implements SyncEngine {
       }
 
       for (const [docPath, tombstone] of snapFileTombstones) {
+        if (isPathIgnoredBySync(docPath)) continue;
         if (snapPathToId.has(docPath)) continue;
         this.fileTombstones.set(docPath, tombstone);
         removedMarkdownPaths.add(docPath);
       }
 
       for (const [docPath, ref] of this.pathToBlob) {
+        if (isPathIgnoredBySync(docPath)) continue;
         if (snapPathToBlob.has(docPath)) continue;
         this.pathToBlob.delete(docPath);
         this.blobTombstones.set(docPath, { hash: ref.hash, deletedAt });
@@ -937,12 +952,14 @@ export class VaultSyncEngine implements SyncEngine {
       }
 
       for (const [docPath, ref] of snapPathToBlob) {
+        if (isPathIgnoredBySync(docPath)) continue;
         this.pathToBlob.set(docPath, ref);
         this.blobTombstones.delete(docPath);
         materializedBlobPaths.add(docPath);
       }
 
       for (const [docPath, tombstone] of snapBlobTombstones) {
+        if (isPathIgnoredBySync(docPath)) continue;
         if (snapPathToBlob.has(docPath)) continue;
         this.blobTombstones.set(docPath, tombstone);
         removedBlobPaths.add(docPath);
@@ -1020,7 +1037,7 @@ export class VaultSyncEngine implements SyncEngine {
   private async persistMarkdownPending(): Promise<void> {
     await this.markdownPendingStore.save(this.localCacheKey, {
       vaultId: this.localCacheKey,
-      pendingLocalDeletions: [...this.pendingLocalMarkdownDeletions],
+      pendingLocalDeletions: [...this.pendingLocalMarkdownDeletions].filter((docPath) => !isPathIgnoredBySync(docPath)),
       localPath: this.mount?.localPath,
       updatedAt: new Date().toISOString(),
     });
@@ -1032,6 +1049,7 @@ export class VaultSyncEngine implements SyncEngine {
     if (saved.localPath !== this.mount?.localPath) return;
 
     for (const docPath of saved.pendingLocalDeletions) {
+      if (isPathIgnoredBySync(docPath)) continue;
       if (this.pendingLocalMarkdownDeletions.has(docPath)) continue;
       // File has reappeared on disk → user likely undid the delete
       if (this.plugin.app.vault.getAbstractFileByPath(this.toVaultPath(docPath))) continue;
@@ -1061,6 +1079,7 @@ export class VaultSyncEngine implements SyncEngine {
   }
 
   private queueRemoteMarkdownDelete(docPath: string): void {
+    if (isPathIgnoredBySync(docPath)) return;
     this.pendingRemoteMarkdownDeletes.add(docPath);
   }
 
@@ -1071,9 +1090,11 @@ export class VaultSyncEngine implements SyncEngine {
     // intent does not wait for another remote transaction.
     await this.convergePendingLocalMarkdownDeletions();
     for (const decision of this.markdownTombstones.getReplayDecisions()) {
+      if (isPathIgnoredBySync(decision.path)) continue;
       this.queueRemoteMarkdownDelete(decision.path);
     }
     for (const docPath of this.fileTombstones.keys()) {
+      if (isPathIgnoredBySync(docPath)) continue;
       if (this.markdownTombstones.getDecision(docPath).kind === 'absent') {
         this.queueRemoteMarkdownDelete(docPath);
       }
@@ -1088,7 +1109,8 @@ export class VaultSyncEngine implements SyncEngine {
     const changes = changedMapKeys(txn, tombMap).map((path) => ({
       path,
       tombstone: tombMap.get(path),
-    }));
+    })).filter((change) => !isPathIgnoredBySync(change.path));
+    if (changes.length === 0) return;
     const origin = this.getTombstoneReceiptOrigin(txn.origin);
     const provenance = this.getTombstoneReceiptProvenance(origin);
     this.markdownTombstones.applyTransaction(changes, { origin, provenance });
@@ -1137,6 +1159,7 @@ export class VaultSyncEngine implements SyncEngine {
   }
 
   private async applyRemoteMarkdownDelete(docPath: string): Promise<void> {
+    if (this.isIgnoredDocPath(docPath)) return;
     if (!this.fileTombstones.has(docPath)) return;
     this.editorBindings?.unbindByPath(this.toVaultPath(docPath));
     this.bridge.notifyFileClosed(this.toVaultPath(docPath));
@@ -1163,6 +1186,7 @@ export class VaultSyncEngine implements SyncEngine {
     const tombMap = this.fileTombstones;
     if (mapChanged(txn, tombMap)) {
       for (const docPath of changedMapKeys(txn, tombMap)) {
+        if (isPathIgnoredBySync(docPath)) continue;
         if (tombMap.has(docPath)) {
           const decision = this.markdownTombstones.getDecision(docPath);
           const replayable = decision.replayable;
@@ -1182,6 +1206,7 @@ export class VaultSyncEngine implements SyncEngine {
     // handleRemoteTransaction 检测不到，需要单独处理。
     if (mapChanged(txn, this.pathToId)) {
       for (const docPath of changedMapKeys(txn, this.pathToId)) {
+        if (this.isIgnoredDocPath(docPath)) continue;
         const fileId = this.pathToId.get(docPath);
         if (!fileId) {
           // 路径从 pathToId 中移除：只有同一事务能证明它是单目标 rename 的源路径时，才清理本地旧路径。
@@ -1215,6 +1240,10 @@ export class VaultSyncEngine implements SyncEngine {
   private getOpenMarkdownViews(): MarkdownView[] {
     const leaves = this.plugin.app.workspace.getLeavesOfType('markdown') as unknown as Array<{ view: MarkdownView }>;
     return leaves.map((leaf) => leaf.view).filter((view): view is MarkdownView => !!view && !!view.file);
+  }
+
+  private isIgnoredDocPath(docPath: string): boolean {
+    return isPathIgnoredBySync(docPath) || isPathIgnoredBySync(this.toVaultPath(docPath));
   }
 
   private bindAllOpenEditors(): void {
