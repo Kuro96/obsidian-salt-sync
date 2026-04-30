@@ -87,6 +87,8 @@ describe('VaultSyncEngine', () => {
       expect(engine.isPathForThisEngine('notes/.stfolder')).toBe(false);
       expect(engine.isPathForThisEngine('notes/.stversions/old.md')).toBe(false);
       expect(engine.isPathForThisEngine('notes/foo.sync-conflict-20260428.md')).toBe(false);
+      expect(engine.isPathForThisEngine('notes/~syncthing~foo.md.tmp')).toBe(false);
+      expect(engine.isPathForThisEngine('notes/draft.tmp')).toBe(true);
     });
   });
 

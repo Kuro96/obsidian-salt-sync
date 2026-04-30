@@ -1,29 +1,6 @@
 import type { SharedDirectoryMount } from '@salt-sync/shared';
-
-export function normalizeVaultPath(path: string): string {
-  return path
-    .trim()
-    .replace(/\\/g, '/')
-    .replace(/^\/+/, '')
-    .replace(/\/+$/, '')
-    .replace(/\/+/g, '/');
-}
-
-export function isPathIgnoredBySync(vaultPath: string): boolean {
-  const normalized = normalizeVaultPath(vaultPath);
-  if (!normalized) return false;
-  const segments = normalized.split('/');
-  return segments.some((segment) => segment === '.obsidian' || segment === '.trash')
-    || segments.some((segment) => segment === '.stfolder' || segment === '.stversions' || segment === '.stignore')
-    || segments.some((segment) => segment.includes('.sync-conflict-'));
-}
-
-export function isSameOrChildPath(path: string, parent: string): boolean {
-  const normalizedPath = normalizeVaultPath(path);
-  const normalizedParent = normalizeVaultPath(parent);
-  if (!normalizedPath || !normalizedParent) return false;
-  return normalizedPath === normalizedParent || normalizedPath.startsWith(normalizedParent + '/');
-}
+export { isPathIgnoredBySync, isSameOrChildPath, normalizeVaultPath } from '@salt-sync/shared';
+import { isPathIgnoredBySync, isSameOrChildPath, normalizeVaultPath } from '@salt-sync/shared';
 
 export function validateSharedMountOverlaps(
   mounts: SharedDirectoryMount[],
