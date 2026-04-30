@@ -681,12 +681,56 @@ describe('BlobSync reconcile', () => {
     vault.seedBinary('.trash/deleted.png', new Uint8Array([2]));
     vault.seedBinary('notes/.stversions/old.png', new Uint8Array([3]));
     vault.seedBinary('notes/foo.sync-conflict-20260428.png', new Uint8Array([4]));
+    vault.seedBinary('notes/~syncthing~foo.png.tmp', new Uint8Array([5]));
 
     const sync = new BlobSync('ws://server.test', 'vault-a', 'token-a', vault as never, ydoc);
     await sync.reconcile('authoritative');
 
     expect((ydoc.getMap('pathToBlob') as Y.Map<unknown>).size).toBe(0);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('filters ignored pending runtime state and exposes pending details', async () => {
+    const runtime = createRuntimeStateStore();
+    await runtime.store.save('vault-a', {
+      vaultId: 'vault-a',
+      pendingRemoteDownloads: [
+        { docPath: 'assets/download.png', hash: 'download-hash' },
+        { docPath: '~syncthing~download.png.tmp', hash: 'ignored-download' },
+      ],
+      pendingRemoteDeletes: ['assets/delete.png', '~syncthing~delete.png.tmp'],
+      pendingLocalUpserts: ['assets/upload.png', '~syncthing~upload.png.tmp'],
+      pendingLocalDeletions: [
+        { docPath: 'assets/local-delete.png', hash: 'local-delete-hash' },
+        { docPath: '~syncthing~local-delete.png.tmp', hash: null },
+      ],
+      knownLocalPaths: ['assets/known.png', '~syncthing~known.png.tmp'],
+      updatedAt: new Date().toISOString(),
+    });
+
+    const vault = new MockVault();
+    vault.seedBinary('assets/upload.png', new Uint8Array([1]));
+    const ydoc = new Y.Doc();
+    (ydoc.getMap('pathToBlob') as Y.Map<{ hash: string; size: number; updatedAt: string }>).set('assets/download.png', {
+      hash: 'download-hash',
+      size: 42,
+      updatedAt: new Date().toISOString(),
+    });
+    (ydoc.getMap('blobTombstones') as Y.Map<{ hash: string; deletedAt: string }>).set('assets/delete.png', {
+      hash: 'delete-hash',
+      deletedAt: new Date().toISOString(),
+    });
+
+    const sync = new BlobSync('ws://server.test', 'vault-a', 'token-a', vault as never, ydoc, undefined, undefined, undefined, runtime.store);
+    await sync.restoreRuntimeState();
+
+    expect(sync.getPendingBlobItems().map((item) => `${item.kind}:${item.path}`)).toEqual([
+      'download:assets/download.png',
+      'upload:assets/upload.png',
+      'remote-delete:assets/delete.png',
+      'local-delete:assets/local-delete.png',
+    ]);
+    expect(runtime.snapshot()?.knownLocalPaths).toEqual(['assets/known.png']);
   });
 
   it('restores pending remote downloads after reload', async () => {
