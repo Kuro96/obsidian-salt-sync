@@ -18,11 +18,27 @@ export interface BlobRef {
 export interface BlobTombstone {
   hash: BlobHash;
   deletedAt: string;
+  /** 删除来源设备 ID（可选，旧格式兼容） */
+  deviceId?: string;
+  /** 删除来源设备名称（可选） */
+  deviceName?: string;
+  /** 删除来源 vaultId（可选，用于共享目录挂载场景） */
+  vaultId?: string;
+  /** 删除原因：local-delete | reconcile-missing | snapshot-restore 等 */
+  deleteSource?: string;
 }
 
 /** 已删除 markdown 文件的 tombstone */
 export interface FileTombstone {
   deletedAt: string;
+  /** 删除来源设备 ID（可选，旧格式兼容） */
+  deviceId?: string;
+  /** 删除来源设备名称（可选） */
+  deviceName?: string;
+  /** 删除来源 vaultId（可选，用于共享目录挂载场景） */
+  vaultId?: string;
+  /** 删除原因：local-delete | reconcile-missing | snapshot-restore 等 */
+  deleteSource?: string;
 }
 
 // ─── Snapshot 元数据 ─────────────────────────────────────────────────────────

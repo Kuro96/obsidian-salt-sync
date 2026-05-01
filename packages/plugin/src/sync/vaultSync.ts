@@ -374,6 +374,8 @@ export class VaultSyncEngine implements SyncEngine {
       `${this.effectiveSettings.serverUrl}::${this.effectiveSettings.vaultId}`,
       this.mount?.localPath,
       (docPath) => this.isIgnoredDocPath(docPath),
+      this.effectiveSettings.deviceId,
+      this.deviceName,
     );
     this.enterMarkdownStartupGate();
     this.blobSync.enterStartupGate();
@@ -712,7 +714,7 @@ export class VaultSyncEngine implements SyncEngine {
       if (localDocPaths.has(docPath)) continue;
       if (this.fileTombstones.has(docPath)) continue;
       if (!this.knownLocalMarkdownPaths.has(docPath)) continue;
-      this.handleLocalFileDeletion(docPath);
+      this.handleLocalFileDeletion(docPath, 'reconcile-missing');
     }
     console.log(`[VaultSync] reconcile — ${files.length} files (${this.mount?.localPath ?? 'primary'})`);
   }
@@ -782,7 +784,7 @@ export class VaultSyncEngine implements SyncEngine {
     }
   }
 
-  handleLocalFileDeletion(docPath: string): void {
+  handleLocalFileDeletion(docPath: string, deleteSource = 'local-delete'): void {
     this.editorBindings?.unbindByPath(this.toVaultPath(docPath));
     this.knownLocalMarkdownPaths.delete(docPath);
     const fileId = this.pathToId.get(docPath);
@@ -794,7 +796,7 @@ export class VaultSyncEngine implements SyncEngine {
       return;
     }
 
-    this.writeLocalMarkdownTombstone(docPath, fileId);
+    this.writeLocalMarkdownTombstone(docPath, fileId, deleteSource);
   }
 
   private shouldBlockRemoteMarkdownFlush(docPath: string): boolean {
@@ -856,19 +858,25 @@ export class VaultSyncEngine implements SyncEngine {
     }
   }
 
-  private writeLocalMarkdownTombstone(docPath: string, fileId: string): void {
+  private writeLocalMarkdownTombstone(docPath: string, fileId: string, deleteSource = 'local-delete'): void {
     this.pendingLocalMarkdownDeletions.delete(docPath);
     this.ydoc.transact(() => {
       this.pathToId.delete(docPath);
       this.idToPath.delete(fileId);
       this.docs.delete(fileId);
-      this.fileTombstones.set(docPath, { deletedAt: new Date().toISOString() });
+      this.fileTombstones.set(docPath, {
+        deletedAt: new Date().toISOString(),
+        deviceId: this.effectiveSettings.deviceId,
+        deviceName: this.deviceName,
+        vaultId: this.effectiveSettings.vaultId,
+        deleteSource,
+      });
     }, 'local-delete');
   }
 
   private handleExternalMarkdownDeletion(docPath: string): void {
     if (!this.knownLocalMarkdownPaths.has(docPath)) return;
-    this.handleLocalFileDeletion(docPath);
+    this.handleLocalFileDeletion(docPath, 'external-delete');
   }
 
   async handleRemoteUpdate(update: Uint8Array): Promise<void> {
@@ -917,7 +925,13 @@ export class VaultSyncEngine implements SyncEngine {
         this.pathToId.delete(docPath);
         this.idToPath.delete(fileId);
         this.docs.delete(fileId);
-        this.fileTombstones.set(docPath, { deletedAt });
+        this.fileTombstones.set(docPath, {
+          deletedAt,
+          deviceId: this.effectiveSettings.deviceId,
+          deviceName: this.deviceName,
+          vaultId: this.effectiveSettings.vaultId,
+          deleteSource: 'snapshot-restore',
+        });
         removedMarkdownPaths.add(docPath);
       }
 
@@ -944,7 +958,10 @@ export class VaultSyncEngine implements SyncEngine {
       for (const [docPath, tombstone] of snapFileTombstones) {
         if (this.isIgnoredDocPath(docPath)) continue;
         if (snapPathToId.has(docPath)) continue;
-        this.fileTombstones.set(docPath, tombstone);
+        this.fileTombstones.set(docPath, {
+          ...tombstone,
+          deleteSource: tombstone.deleteSource ?? 'snapshot-restore',
+        });
         removedMarkdownPaths.add(docPath);
       }
 
@@ -952,7 +969,14 @@ export class VaultSyncEngine implements SyncEngine {
         if (this.isIgnoredDocPath(docPath)) continue;
         if (snapPathToBlob.has(docPath)) continue;
         this.pathToBlob.delete(docPath);
-        this.blobTombstones.set(docPath, { hash: ref.hash, deletedAt });
+        this.blobTombstones.set(docPath, {
+          hash: ref.hash,
+          deletedAt,
+          deviceId: this.effectiveSettings.deviceId,
+          deviceName: this.deviceName,
+          vaultId: this.effectiveSettings.vaultId,
+          deleteSource: 'snapshot-restore',
+        });
         removedBlobPaths.add(docPath);
       }
 
@@ -966,7 +990,10 @@ export class VaultSyncEngine implements SyncEngine {
       for (const [docPath, tombstone] of snapBlobTombstones) {
         if (this.isIgnoredDocPath(docPath)) continue;
         if (snapPathToBlob.has(docPath)) continue;
-        this.blobTombstones.set(docPath, tombstone);
+        this.blobTombstones.set(docPath, {
+          ...tombstone,
+          deleteSource: tombstone.deleteSource ?? 'snapshot-restore',
+        });
         removedBlobPaths.add(docPath);
       }
     }, 'restore');

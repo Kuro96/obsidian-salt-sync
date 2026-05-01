@@ -747,6 +747,58 @@ describe('VaultSyncEngine', () => {
     });
   });
 
+  describe('tombstone provenance metadata', () => {
+    it('local markdown tombstone includes deviceId, deviceName, vaultId, and deleteSource', () => {
+      const settings = baseSettings();
+      settings.deviceId = 'dev-abc-123';
+      settings.deviceName = 'Test Device';
+      const engine = new VaultSyncEngine(fakePlugin(), settings, null);
+      const { ydoc, pathToId, idToPath, docs, tombstones } = internals(engine);
+
+      const fileId = 'file-provenance-1';
+      ydoc.transact(() => {
+        pathToId.set('provenance.md', fileId);
+        idToPath.set(fileId, 'provenance.md');
+        docs.set(fileId, new Y.Text());
+      });
+
+      engine.handleLocalFileDeletion('provenance.md');
+
+      expect(tombstones.has('provenance.md')).toBe(true);
+      const ts = tombstones.get('provenance.md')!;
+      expect(ts.deviceId).toBe('dev-abc-123');
+      expect(ts.deviceName).toBe('Test Device');
+      expect(ts.vaultId).toBe('primary');
+      expect(ts.deleteSource).toBe('local-delete');
+      expect(typeof ts.deletedAt).toBe('string');
+    });
+
+    it('mount engine tombstone carries mount vaultId, not primary vaultId', () => {
+      const settings = baseSettings();
+      settings.deviceId = 'dev-mount-1';
+      const mount: SharedDirectoryMount = {
+        localPath: 'Shared',
+        vaultId: 'mount-vault-id',
+        token: 't',
+      };
+      const engine = new VaultSyncEngine(fakePlugin(), settings, mount);
+      const { ydoc, pathToId, idToPath, docs, tombstones } = internals(engine);
+
+      const fileId = 'file-mount-1';
+      ydoc.transact(() => {
+        pathToId.set('test.md', fileId);
+        idToPath.set(fileId, 'test.md');
+        docs.set(fileId, new Y.Text());
+      });
+
+      engine.handleLocalFileDeletion('test.md');
+
+      const ts = tombstones.get('test.md')!;
+      expect(ts.vaultId).toBe('mount-vault-id');
+      expect(ts.deleteSource).toBe('local-delete');
+    });
+  });
+
   describe('handleLocalFileRename', () => {
     async function setupRenameTestEngine() {
       const plugin = new MockPlugin();
@@ -986,6 +1038,7 @@ describe('VaultSyncEngine', () => {
       await engine.reconcile();
 
       expect(tombstones.has('missing.md')).toBe(true);
+      expect(tombstones.get('missing.md')?.deleteSource).toBe('reconcile-missing');
       expect(tombstones.has('present.md')).toBe(false);
       // pathToId entry for missing.md should be cleaned up
       expect(pathToId.has('missing.md')).toBe(false);
