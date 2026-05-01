@@ -32,6 +32,11 @@ interface IgnoredPathCleanupBody {
   confirmText?: unknown;
 }
 
+interface SnapshotRestoreBody {
+  confirmVaultId?: unknown;
+  confirmText?: unknown;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -236,6 +241,7 @@ export class AdminApiRouter {
       const snapshotRestoreMatch = pathname.match(/^\/admin\/api\/vaults\/([^/]+)\/snapshots\/([^/]+)\/restore$/);
       if (snapshotRestoreMatch && req.method === 'POST') {
         await this.handleAdminSnapshotRestore(
+          req,
           res,
           decodeURIComponent(snapshotRestoreMatch[1]),
           decodeURIComponent(snapshotRestoreMatch[2]),
@@ -277,6 +283,10 @@ export class AdminApiRouter {
       }
       if (err instanceof Error && /^(confirm_vault_id_required|confirm_text_required|dryRun_must_be_boolean)$/.test(err.message)) {
         sendJson(res, errorStatus(err.message), { error: err.message });
+        return true;
+      }
+      if (err instanceof Error && /^(confirm_vault_id_mismatch|confirm_text_invalid)$/.test(err.message)) {
+        sendJson(res, 400, { error: err.message });
         return true;
       }
       if (err instanceof Error && err.message === 'body_must_be_object') {
@@ -504,10 +514,36 @@ export class AdminApiRouter {
   }
 
   private async handleAdminSnapshotRestore(
+    req: IncomingMessage,
     res: ServerResponse,
     vaultId: string,
     snapshotId: string,
   ): Promise<void> {
+    const rawBody = await readJsonBody(req);
+    if (!isRecord(rawBody)) {
+      sendJson(res, 400, { error: 'body_must_be_object' });
+      return;
+    }
+    const body = rawBody as SnapshotRestoreBody;
+
+    const confirmVaultId = typeof body.confirmVaultId === 'string' ? body.confirmVaultId : undefined;
+    const confirmText = typeof body.confirmText === 'string' ? body.confirmText : undefined;
+
+    if (!confirmVaultId) {
+      throw new Error('confirm_vault_id_required');
+    }
+    if (!confirmText) {
+      throw new Error('confirm_text_required');
+    }
+    if (confirmVaultId !== vaultId) {
+      sendJson(res, 400, { error: 'confirm_vault_id_mismatch' });
+      return;
+    }
+    if (confirmText !== 'RESTORE') {
+      sendJson(res, 400, { error: 'confirm_text_invalid' });
+      return;
+    }
+
     const stored = await this.getSnapshotStore().get(vaultId, snapshotId);
     if (!stored) {
       sendJson(res, 404, { error: 'not_found' });

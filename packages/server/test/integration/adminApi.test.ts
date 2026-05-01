@@ -392,7 +392,8 @@ skipIfNoMinio('Admin snapshot API integration', () => {
       `${srv.baseUrl}/admin/api/vaults/vault-restore/snapshots/${created.snapshotId}/restore`,
       {
         method: 'POST',
-        headers: { Authorization: 'Bearer admin' },
+        headers: { Authorization: 'Bearer admin', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirmVaultId: 'vault-restore', confirmText: 'RESTORE' }),
       },
     );
     expect(restoreRes.status).toBe(200);
@@ -405,6 +406,177 @@ skipIfNoMinio('Admin snapshot API integration', () => {
     });
     expect(afterRestoreFile.status).toBe(200);
     expect(await afterRestoreFile.text()).toBe('before restore');
+  });
+
+  describe('snapshot restore confirmation guard', () => {
+    it('returns 400 when confirmVaultId is missing', async () => {
+      srv = await startTestServer({ serverToken: 'admin', withS3: true });
+
+      const room = await srv.app.roomManager.getOrCreate('vault-confirm');
+      await room.load();
+
+      const createRes = await fetch(`${srv.baseUrl}/admin/api/vaults/vault-confirm/snapshots`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer admin' },
+      });
+      expect(createRes.status).toBe(201);
+      const created = (await createRes.json()) as SnapshotMeta;
+
+      const restoreRes = await fetch(
+        `${srv.baseUrl}/admin/api/vaults/vault-confirm/snapshots/${created.snapshotId}/restore`,
+        {
+          method: 'POST',
+          headers: { Authorization: 'Bearer admin', 'Content-Type': 'application/json' },
+          body: JSON.stringify({ confirmText: 'RESTORE' }),
+        },
+      );
+      expect(restoreRes.status).toBe(400);
+      const body = (await restoreRes.json()) as { error: string };
+      expect(body.error).toBe('confirm_vault_id_required');
+    });
+
+    it('returns 400 when confirmText is missing', async () => {
+      srv = await startTestServer({ serverToken: 'admin', withS3: true });
+
+      const room = await srv.app.roomManager.getOrCreate('vault-confirm2');
+      await room.load();
+
+      const createRes = await fetch(`${srv.baseUrl}/admin/api/vaults/vault-confirm2/snapshots`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer admin' },
+      });
+      expect(createRes.status).toBe(201);
+      const created = (await createRes.json()) as SnapshotMeta;
+
+      const restoreRes = await fetch(
+        `${srv.baseUrl}/admin/api/vaults/vault-confirm2/snapshots/${created.snapshotId}/restore`,
+        {
+          method: 'POST',
+          headers: { Authorization: 'Bearer admin', 'Content-Type': 'application/json' },
+          body: JSON.stringify({ confirmVaultId: 'vault-confirm2' }),
+        },
+      );
+      expect(restoreRes.status).toBe(400);
+      const body = (await restoreRes.json()) as { error: string };
+      expect(body.error).toBe('confirm_text_required');
+    });
+
+    it('returns 400 when confirmVaultId does not match vaultId', async () => {
+      srv = await startTestServer({ serverToken: 'admin', withS3: true });
+
+      const room = await srv.app.roomManager.getOrCreate('vault-confirm3');
+      await room.load();
+
+      const createRes = await fetch(`${srv.baseUrl}/admin/api/vaults/vault-confirm3/snapshots`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer admin' },
+      });
+      expect(createRes.status).toBe(201);
+      const created = (await createRes.json()) as SnapshotMeta;
+
+      const restoreRes = await fetch(
+        `${srv.baseUrl}/admin/api/vaults/vault-confirm3/snapshots/${created.snapshotId}/restore`,
+        {
+          method: 'POST',
+          headers: { Authorization: 'Bearer admin', 'Content-Type': 'application/json' },
+          body: JSON.stringify({ confirmVaultId: 'wrong-vault', confirmText: 'RESTORE' }),
+        },
+      );
+      expect(restoreRes.status).toBe(400);
+      const body = (await restoreRes.json()) as { error: string };
+      expect(body.error).toBe('confirm_vault_id_mismatch');
+    });
+
+    it('returns 400 when confirmText is not RESTORE', async () => {
+      srv = await startTestServer({ serverToken: 'admin', withS3: true });
+
+      const room = await srv.app.roomManager.getOrCreate('vault-confirm4');
+      await room.load();
+
+      const createRes = await fetch(`${srv.baseUrl}/admin/api/vaults/vault-confirm4/snapshots`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer admin' },
+      });
+      expect(createRes.status).toBe(201);
+      const created = (await createRes.json()) as SnapshotMeta;
+
+      const restoreRes = await fetch(
+        `${srv.baseUrl}/admin/api/vaults/vault-confirm4/snapshots/${created.snapshotId}/restore`,
+        {
+          method: 'POST',
+          headers: { Authorization: 'Bearer admin', 'Content-Type': 'application/json' },
+          body: JSON.stringify({ confirmVaultId: 'vault-confirm4', confirmText: 'wrong text' }),
+        },
+      );
+      expect(restoreRes.status).toBe(400);
+      const body = (await restoreRes.json()) as { error: string };
+      expect(body.error).toBe('confirm_text_invalid');
+    });
+
+    it('returns 200 and succeeds with valid confirmation', async () => {
+      srv = await startTestServer({ serverToken: 'admin', withS3: true });
+
+      const room = await srv.app.roomManager.getOrCreate('vault-confirm5');
+      await room.load();
+      const text = new Y.Text();
+      text.insert(0, 'before restore');
+      room.pathToId.set('test.md', 'f1');
+      room.idToPath.set('f1', 'test.md');
+      room.docs.set('f1', text);
+
+      const createRes = await fetch(`${srv.baseUrl}/admin/api/vaults/vault-confirm5/snapshots`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer admin' },
+      });
+      expect(createRes.status).toBe(201);
+      const created = (await createRes.json()) as SnapshotMeta;
+
+      // Change state
+      const changed = new Y.Doc();
+      const changedText = new Y.Text();
+      changedText.insert(0, 'after change');
+      changed.getMap<string>('pathToId').set('test.md', 'f1');
+      changed.getMap<string>('idToPath').set('f1', 'test.md');
+      changed.getMap<Y.Text>('docs').set('f1', changedText);
+      await room.restoreFromSnapshotPayload(Y.encodeStateAsUpdate(changed), 'test-change');
+
+      // Now restore with valid confirmation
+      const restoreRes = await fetch(
+        `${srv.baseUrl}/admin/api/vaults/vault-confirm5/snapshots/${created.snapshotId}/restore`,
+        {
+          method: 'POST',
+          headers: { Authorization: 'Bearer admin', 'Content-Type': 'application/json' },
+          body: JSON.stringify({ confirmVaultId: 'vault-confirm5', confirmText: 'RESTORE' }),
+        },
+      );
+      expect(restoreRes.status).toBe(200);
+      const body = (await restoreRes.json()) as { restored: boolean; snapshotId: string };
+      expect(body.restored).toBe(true);
+      expect(body.snapshotId).toBe(created.snapshotId);
+
+      // Verify state was restored
+      const fileRes = await fetch(`${srv.baseUrl}/vault/vault-confirm5/files/test.md`, {
+        headers: { Authorization: 'Bearer admin' },
+      });
+      expect(fileRes.status).toBe(200);
+      expect(await fileRes.text()).toBe('before restore');
+    });
+
+    it('returns 404 when snapshot does not exist (not_found behavior preserved)', async () => {
+      srv = await startTestServer({ serverToken: 'admin', withS3: true });
+
+      const restoreRes = await fetch(
+        `${srv.baseUrl}/admin/api/vaults/vault-confirm6/snapshots/00000000-0000-0000-0000-000000000000/restore`,
+        {
+          method: 'POST',
+          headers: { Authorization: 'Bearer admin', 'Content-Type': 'application/json' },
+          body: JSON.stringify({ confirmVaultId: 'vault-confirm6', confirmText: 'RESTORE' }),
+        },
+      );
+      expect(restoreRes.status).toBe(404);
+      const body = (await restoreRes.json()) as { error: string };
+      expect(body.error).toBe('not_found');
+    });
   });
 });
 
@@ -422,12 +594,28 @@ describe('Admin API — rooms 404 and snapshot 404 paths', () => {
 });
 
 skipIfNoMinio('Admin snapshot API — 404 paths', () => {
-  it('POST /admin/api/.../snapshots/:id/restore returns 404 when snapshotId does not exist', async () => {
+  it('POST /admin/api/.../snapshots/:id/restore returns 400 when no confirmation body is sent', async () => {
     srv = await startTestServer({ serverToken: 'admin', withS3: true });
 
     const res = await fetch(
       `${srv.baseUrl}/admin/api/vaults/some-vault/snapshots/00000000-0000-0000-0000-000000000000/restore`,
-      { method: 'POST', headers: { Authorization: 'Bearer admin' } },
+      { method: 'POST', headers: { Authorization: 'Bearer admin', 'Content-Type': 'application/json' } },
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe('confirm_vault_id_required');
+  });
+
+  it('POST /admin/api/.../snapshots/:id/restore returns 404 when snapshot does not exist (confirmed)', async () => {
+    srv = await startTestServer({ serverToken: 'admin', withS3: true });
+
+    const res = await fetch(
+      `${srv.baseUrl}/admin/api/vaults/some-vault/snapshots/00000000-0000-0000-0000-000000000000/restore`,
+      {
+        method: 'POST',
+        headers: { Authorization: 'Bearer admin', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirmVaultId: 'some-vault', confirmText: 'RESTORE' }),
+      },
     );
     expect(res.status).toBe(404);
     const body = (await res.json()) as { error: string };

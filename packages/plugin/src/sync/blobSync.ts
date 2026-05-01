@@ -109,6 +109,10 @@ export class BlobSync {
     /** 共享目录的本地挂载路径（主 vault 为 undefined）。用于检测路径切换后跳过失效的 knownLocalPaths。 */
     private readonly localPath?: string,
     private readonly isIgnoredPath: (docPath: string) => boolean = (docPath) => isPathIgnoredBySync(docPath),
+    /** 设备 ID（可选，用于 tombstone 溯源） */
+    private readonly deviceId?: string,
+    /** 设备名称（可选，用于 tombstone 溯源） */
+    private readonly deviceName?: string,
   ) {
     this.httpBase = wsUrlToHttpUrl(wsUrl);
     this.toVaultPath = toVaultPath;
@@ -706,6 +710,10 @@ export class BlobSync {
         this.blobTombstones.set(docPath, {
           hash,
           deletedAt: new Date().toISOString(),
+          deviceId: this.deviceId,
+          deviceName: this.deviceName,
+          vaultId: this.vaultId,
+          deleteSource: 'local-delete',
         });
         this.pendingLocalDeletions.delete(docPath);
         this.knownLocalPaths.delete(docPath);
@@ -860,6 +868,10 @@ export class BlobSync {
       this.blobTombstones.set(path, {
         hash,
         deletedAt: new Date().toISOString(),
+        deviceId: this.deviceId,
+        deviceName: this.deviceName,
+        vaultId: this.vaultId,
+        deleteSource: 'local-delete',
       });
     }, 'local-blob');
     this.pendingLocalDeletions.delete(path);

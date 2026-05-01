@@ -491,6 +491,92 @@ describe('BlobSync reconcile', () => {
     expect(new Uint8Array(await vault.readBinary(file!))).toEqual(bytes);
   });
 
+  describe('local blob tombstone provenance metadata', () => {
+    it('includes deviceId, deviceName, vaultId, and deleteSource on local delete', async () => {
+      const vault = new MockVault();
+      const ydoc = new Y.Doc();
+      const bytes = new Uint8Array([1, 2, 3]);
+      const hash = sha256hex(bytes);
+      vault.seedBinary('assets/image.png', bytes);
+
+      // Directly set pathToBlob to avoid real upload through handleLocalBlobChange
+      (ydoc.getMap('pathToBlob') as Y.Map<{ hash: string; size: number; updatedAt: string }>).set('assets/image.png', {
+        hash,
+        size: bytes.byteLength,
+        updatedAt: new Date().toISOString(),
+      });
+
+      const sync = new BlobSync(
+        'ws://server.test',
+        'vault-a',
+        'token-a',
+        vault as never,
+        ydoc,
+        (p) => p,
+        (p) => p,
+        () => true,
+        null,
+        'vault-a',
+        undefined,
+        () => false,
+        'dev-123',
+        'Test Device',
+      );
+
+      await sync.openRemoteApplyGate();
+
+      // Now delete the file locally
+      await vault.delete(vault.getFileByPath('assets/image.png')!);
+      await sync.handleLocalBlobDeletion('assets/image.png');
+      await sync.flushPendingLocalDeletions();
+
+      const tombstones = ydoc.getMap('blobTombstones') as Y.Map<{ hash: string; deletedAt: string; deviceId?: string; deviceName?: string; vaultId?: string; deleteSource?: string }>;
+      expect(tombstones.has('assets/image.png')).toBe(true);
+      const ts = tombstones.get('assets/image.png')!;
+      expect(ts.deviceId).toBe('dev-123');
+      expect(ts.deviceName).toBe('Test Device');
+      expect(ts.vaultId).toBe('vault-a');
+      expect(ts.deleteSource).toBe('local-delete');
+      expect(ts.hash).toBe(hash);
+    });
+
+    it('flushPendingLocalDeletions also writes provenance metadata', async () => {
+      const vault = new MockVault();
+      const ydoc = new Y.Doc();
+      const bytes = new Uint8Array([9, 9, 9]);
+      const hash = sha256hex(bytes);
+      (ydoc.getMap('pathToBlob') as Y.Map<{ hash: string }>).set('assets/pending.png', { hash });
+
+      const sync = new BlobSync(
+        'ws://server.test',
+        'vault-b',
+        'token-b',
+        vault as never,
+        ydoc,
+        (p) => p,
+        (p) => p,
+        () => true,
+        null,
+        'vault-b',
+        undefined,
+        () => false,
+        'dev-456',
+        'Another Device',
+      );
+
+      // Simulate a pending deletion that gets flushed
+      await sync.handleLocalBlobDeletion('assets/pending.png');
+      await sync.flushPendingLocalDeletions();
+
+      const tombstones = ydoc.getMap('blobTombstones') as Y.Map<{ hash: string; deviceId?: string; vaultId?: string; deleteSource?: string }>;
+      expect(tombstones.has('assets/pending.png')).toBe(true);
+      const ts = tombstones.get('assets/pending.png')!;
+      expect(ts.deviceId).toBe('dev-456');
+      expect(ts.vaultId).toBe('vault-b');
+      expect(ts.deleteSource).toBe('local-delete');
+    });
+  });
+
   it('remote blob delete does not delete a folder at the blob path', async () => {
     const vault = new MockVault();
     const ydoc = new Y.Doc();

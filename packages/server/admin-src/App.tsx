@@ -1032,13 +1032,23 @@ function SnapshotsPage({ token }: { token: string }) {
 
   const restoreSnapshot = async (snapshotId: string) => {
     if (!vaultId.trim()) return;
-    if (!window.confirm(`Restore snapshot "${snapshotId}"? This will overwrite the current vault state with the snapshot contents.`)) return;
+    const confirmInput = window.prompt(
+      `To confirm restore for snapshot "${snapshotId}", type RESTORE in the box below. This will overwrite the current vault state with the snapshot contents.`
+    );
+    if (confirmInput !== 'RESTORE') {
+      setStatus(confirmInput === null ? 'Restore cancelled.' : 'Error: confirmation text did not match RESTORE');
+      return;
+    }
     setLoading(true);
     try {
       await requestJson<{ restored: boolean }>(
         `/admin/api/vaults/${encodeURIComponent(vaultId)}/snapshots/${encodeURIComponent(snapshotId)}/restore`,
         token,
-        { method: 'POST' },
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ confirmVaultId: vaultId, confirmText: 'RESTORE' }),
+        },
       );
       setStatus(`Restored snapshot ${snapshotId}`);
     } catch (error: unknown) {
