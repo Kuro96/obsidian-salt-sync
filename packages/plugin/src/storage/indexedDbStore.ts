@@ -7,6 +7,15 @@ const STORE_NAME = 'local-cache';
 const BLOB_RUNTIME_STORE_NAME = 'blob-runtime-state';
 const DEVICE_META_STORE_NAME = 'device-meta';
 const MARKDOWN_PENDING_STORE_NAME = 'markdown-pending-state';
+const CACHE_VERSION_META_PREFIX = 'localCacheVersion::';
+export const CURRENT_PLUGIN_CACHE_VERSION = '0.4.0';
+export const MIN_SAFE_PLUGIN_CACHE_VERSION = '0.4.0';
+
+export interface PluginCacheVersionMarker {
+  localCacheKey: VaultId;
+  pluginVersion: string;
+  updatedAt: string;
+}
 
 export interface MarkdownPendingState {
   vaultId: VaultId;
@@ -66,6 +75,75 @@ export async function loadDeviceId(): Promise<string | null> {
 export async function saveDeviceId(id: string): Promise<void> {
   const db = await getDb();
   await db.put(DEVICE_META_STORE_NAME, id, 'deviceId');
+}
+
+function cacheVersionMetaKey(localCacheKey: VaultId): string {
+  return `${CACHE_VERSION_META_PREFIX}${localCacheKey}`;
+}
+
+function parseSemver(version: string): [number, number, number] | null {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(version);
+  if (!match) return null;
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+function isVersionAtLeast(version: string, minimum: string): boolean {
+  const parsedVersion = parseSemver(version);
+  const parsedMinimum = parseSemver(minimum);
+  if (!parsedVersion || !parsedMinimum) return false;
+  for (let i = 0; i < parsedVersion.length; i++) {
+    if (parsedVersion[i] > parsedMinimum[i]) return true;
+    if (parsedVersion[i] < parsedMinimum[i]) return false;
+  }
+  return true;
+}
+
+function isPluginCacheVersionMarker(value: unknown, localCacheKey: VaultId): value is PluginCacheVersionMarker {
+  if (!value || typeof value !== 'object') return false;
+  const marker = value as Partial<PluginCacheVersionMarker>;
+  return marker.localCacheKey === localCacheKey && typeof marker.pluginVersion === 'string' && typeof marker.updatedAt === 'string';
+}
+
+export async function loadPluginCacheVersionMarker(localCacheKey: VaultId): Promise<PluginCacheVersionMarker | null> {
+  const db = await getDb();
+  const raw = await db.get(DEVICE_META_STORE_NAME, cacheVersionMetaKey(localCacheKey)) as unknown;
+  return isPluginCacheVersionMarker(raw, localCacheKey) ? raw : null;
+}
+
+export async function savePluginCacheVersionMarker(
+  localCacheKey: VaultId,
+  pluginVersion = CURRENT_PLUGIN_CACHE_VERSION,
+): Promise<void> {
+  const db = await getDb();
+  await db.put(DEVICE_META_STORE_NAME, {
+    localCacheKey,
+    pluginVersion,
+    updatedAt: new Date().toISOString(),
+  } satisfies PluginCacheVersionMarker, cacheVersionMetaKey(localCacheKey));
+}
+
+export function shouldForceRefreshForPluginCacheVersion(marker: PluginCacheVersionMarker | null): boolean {
+  return !marker || !isVersionAtLeast(marker.pluginVersion, MIN_SAFE_PLUGIN_CACHE_VERSION);
+}
+
+export async function clearPerVaultRuntimeState(localCacheKey: VaultId, legacyVaultId: VaultId): Promise<void> {
+  const db = await getDb();
+  const keys = new Set<VaultId>([localCacheKey, legacyVaultId]);
+  for (const key of keys) {
+    await db.delete(STORE_NAME, key);
+    await db.delete(MARKDOWN_PENDING_STORE_NAME, key);
+    await db.delete(BLOB_RUNTIME_STORE_NAME, key);
+  }
+}
+
+export async function refreshLocalRuntimeStateForPluginCacheVersion(
+  localCacheKey: VaultId,
+  legacyVaultId: VaultId,
+): Promise<boolean> {
+  const marker = await loadPluginCacheVersionMarker(localCacheKey);
+  if (!shouldForceRefreshForPluginCacheVersion(marker)) return false;
+  await clearPerVaultRuntimeState(localCacheKey, legacyVaultId);
+  return true;
 }
 
 export class IndexedDbLocalCache implements LocalCache {

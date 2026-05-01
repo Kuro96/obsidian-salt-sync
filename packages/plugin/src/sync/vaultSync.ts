@@ -13,7 +13,13 @@ import type {
   ConnectionStatus,
 } from '@salt-sync/shared';
 import type { SaltSyncSettings } from '../settings';
-import { IndexedDbBlobRuntimeStateStore, IndexedDbLocalCache, IndexedDbMarkdownPendingStore } from '../storage/indexedDbStore';
+import {
+  IndexedDbBlobRuntimeStateStore,
+  IndexedDbLocalCache,
+  IndexedDbMarkdownPendingStore,
+  refreshLocalRuntimeStateForPluginCacheVersion,
+  savePluginCacheVersionMarker,
+} from '../storage/indexedDbStore';
 import { RoomClient } from './roomClient';
 import { EditorBindingManager } from './editorBinding';
 import { ObsidianFilesystemBridge } from './filesystemBridge';
@@ -144,6 +150,16 @@ export class VaultSyncEngine implements SyncEngine {
     );
     if (cleared) {
       console.info(`[VaultSync] cleared legacy local cache key for ${this.effectiveSettings.vaultId}`);
+    }
+  }
+
+  private async refreshLegacyPluginCacheIfNeeded(): Promise<void> {
+    const cleared = await refreshLocalRuntimeStateForPluginCacheVersion(
+      this.localCacheKey,
+      this.effectiveSettings.vaultId,
+    );
+    if (cleared) {
+      console.info(`[VaultSync] cleared pre-0.4.0 local runtime state for ${this.effectiveSettings.vaultId}`);
     }
   }
 
@@ -403,12 +419,14 @@ export class VaultSyncEngine implements SyncEngine {
 
     // Restore local cache after transaction observers are registered so cached
     // startup tombstones are classified before initial reconcile.
+    await this.refreshLegacyPluginCacheIfNeeded();
     await this.clearLegacyLocalCache();
     const cached = await this.cache.load(this.localCacheKey);
     if (cached) {
       Y.applyUpdate(this.ydoc, cached.ydocUpdate, 'cache');
     }
     await this.restoreMarkdownPending();
+    await savePluginCacheVersionMarker(this.localCacheKey);
 
     // Handle incoming server messages
     this.client.onMessage(async (msg) => {
