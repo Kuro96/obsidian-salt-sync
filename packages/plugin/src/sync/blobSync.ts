@@ -7,6 +7,7 @@ import { changedMapKeys, mapChanged } from '../util';
 import { BlobHashCache } from './blobHashCache';
 import type { BlobRuntimeState } from '../storage/indexedDbStore';
 import { isPathIgnoredBySync } from './pathSafety';
+import { ensureParentFolders } from './ensureParentFolders';
 
 interface BlobRuntimeStateStore {
   load(vaultId: VaultId): Promise<BlobRuntimeState | null>;
@@ -492,6 +493,7 @@ export class BlobSync {
     if (existing && 'stat' in existing) {
       await this.vault.modifyBinary(existing as TFile, bytes);
     } else {
+      await ensureParentFolders(this.vault, vaultPath);
       await this.vault.createBinary(vaultPath, bytes);
     }
     const file = this.vault.getFileByPath(vaultPath);

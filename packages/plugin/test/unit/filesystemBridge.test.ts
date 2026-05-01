@@ -55,6 +55,32 @@ describe('ObsidianFilesystemBridge', () => {
     expect(bridge.isSuppressed('note.md', 'something-else')).toBe(false);
   });
 
+  it('flushFile creates missing parent folders before materializing nested markdown under a shared mount', async () => {
+    const ydoc = new Y.Doc();
+    const ytextByPath = new Map<string, Y.Text>();
+    const getYText = (docPath: string): Y.Text | null => ytextByPath.get(docPath) ?? null;
+    const vault = new MockVault();
+    const bridge = new ObsidianFilesystemBridge(
+      vault as unknown as Vault,
+      getYText,
+      ydoc,
+      'primary',
+      (vaultPath) => vaultPath.slice('Shared/'.length),
+      (docPath) => `Shared/${docPath}`,
+    );
+    const ytext = ydoc.getText('nested-note');
+    ytext.insert(0, 'remote nested content');
+    ytextByPath.set('2026-04/618待产物料采购计划.md', ytext);
+
+    await bridge.flushFile('2026-04/618待产物料采购计划.md');
+
+    expect(vault.getAbstractFileByPath('Shared')).toBe(vault.folders.get('Shared'));
+    expect(vault.getAbstractFileByPath('Shared/2026-04')).toBe(vault.folders.get('Shared/2026-04'));
+    const file = vault.getFileByPath('Shared/2026-04/618待产物料采购计划.md')!;
+    expect(file).not.toBeNull();
+    expect(await vault.read(file)).toBe('remote nested content');
+  });
+
   it('does not flush ignored doc paths from remote transactions', async () => {
     const { bridge, vault, ydoc } = setup({ isIgnoredPath: (docPath) => docPath.startsWith('~syncthing~') });
     const docs = ydoc.getMap<Y.Text>('docs');

@@ -1,7 +1,7 @@
 {
   "id": "salt-sync",
   "name": "Salt Sync",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "minAppVersion": "1.0.0",
   "description": "Self-hosted real-time Obsidian sync with snapshot support",
   "author": "Kuro Latency",

@@ -3,7 +3,7 @@
  *
  * Surface used by salt-sync:
  *   Vault: getFileByPath / getAbstractFileByPath / read / readBinary
- *          / modify / modifyBinary / create / createBinary / delete
+ *          / modify / modifyBinary / create / createBinary / createFolder / delete
  *          / getMarkdownFiles / on / off (event emitter)
  *   TFile: stat presence (used as "is TFile" discriminator)
  *   Workspace: on / getActiveViewOfType (returns null in tests)
@@ -77,6 +77,7 @@ export class MockVault {
   }
 
   async create(path: string, content: string): Promise<TFile> {
+    this.assertParentFolderExists(path);
     const now = Date.now();
     const file = new TFile(path, { size: content.length, mtime: now, ctime: now });
     this.files.set(path, file);
@@ -86,6 +87,7 @@ export class MockVault {
   }
 
   async createBinary(path: string, data: ArrayBuffer): Promise<TFile> {
+    this.assertParentFolderExists(path);
     const bytes = new Uint8Array(data);
     const now = Date.now();
     const file = new TFile(path, { size: bytes.byteLength, mtime: now, ctime: now });
@@ -93,6 +95,17 @@ export class MockVault {
     this.contents.set(path, bytes);
     this.emit('create', file);
     return file;
+  }
+
+  async createFolder(path: string): Promise<TFolder> {
+    this.assertParentFolderExists(path);
+    if (this.files.has(path)) throw new Error(`file already exists: ${path}`);
+    const existing = this.folders.get(path);
+    if (existing) return existing;
+    const folder = new TFolder(path);
+    this.folders.set(path, folder);
+    this.emit('create', folder);
+    return folder;
   }
 
   async delete(file: TAbstractFile): Promise<void> {
@@ -155,6 +168,12 @@ export class MockVault {
     const folder = new TFolder(path);
     this.folders.set(path, folder);
     return folder;
+  }
+
+  private assertParentFolderExists(path: string): void {
+    const parent = path.split('/').slice(0, -1).join('/');
+    if (!parent) return;
+    if (!this.folders.has(parent)) throw new Error(`ENOENT: no such file or directory, parent '${parent}'`);
   }
 }
 

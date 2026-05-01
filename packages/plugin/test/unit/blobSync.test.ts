@@ -491,6 +491,44 @@ describe('BlobSync reconcile', () => {
     expect(new Uint8Array(await vault.readBinary(file!))).toEqual(bytes);
   });
 
+  it('reconcile creates missing parent folders before materializing nested blobs under a shared mount', async () => {
+    const vault = new MockVault();
+    const ydoc = new Y.Doc();
+    const bytes = new Uint8Array([4, 3, 2, 1]);
+    const hash = sha256hex(bytes);
+    (ydoc.getMap('pathToBlob') as Y.Map<{ hash: string; size: number; updatedAt: string }>).set('assets/nested/remote.png', {
+      hash,
+      size: bytes.byteLength,
+      updatedAt: new Date().toISOString(),
+    });
+
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.endsWith(`/blobs/${hash}`)) return binaryResponse(bytes);
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const sync = new BlobSync(
+      'ws://server.test',
+      'vault-a',
+      'token-a',
+      vault as never,
+      ydoc,
+      (docPath) => `Shared/${docPath}`,
+      (vaultPath) => vaultPath.slice('Shared/'.length),
+      (vaultPath) => vaultPath.startsWith('Shared/'),
+    );
+
+    await sync.reconcile('authoritative');
+
+    expect(vault.getAbstractFileByPath('Shared')).toBe(vault.folders.get('Shared'));
+    expect(vault.getAbstractFileByPath('Shared/assets')).toBe(vault.folders.get('Shared/assets'));
+    expect(vault.getAbstractFileByPath('Shared/assets/nested')).toBe(vault.folders.get('Shared/assets/nested'));
+    const file = vault.getFileByPath('Shared/assets/nested/remote.png');
+    expect(file).not.toBeNull();
+    expect(new Uint8Array(await vault.readBinary(file!))).toEqual(bytes);
+  });
+
   describe('local blob tombstone provenance metadata', () => {
     it('includes deviceId, deviceName, vaultId, and deleteSource on local delete', async () => {
       const vault = new MockVault();

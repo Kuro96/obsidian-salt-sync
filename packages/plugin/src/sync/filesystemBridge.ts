@@ -4,6 +4,7 @@ import type { Vault, TFile } from 'obsidian';
 import type { FileFingerprint, FilesystemBridge, VaultId } from '@salt-sync/shared';
 import { applyDiffToYText } from './diff';
 import { evaluateExternalEditPolicy, type ExternalEditPolicy } from './externalEditPolicy';
+import { ensureParentFolders } from './ensureParentFolders';
 
 function sha256hex(text: string): string {
   return createHash('sha256').update(text, 'utf8').digest('hex');
@@ -513,6 +514,7 @@ export class ObsidianFilesystemBridge implements FilesystemBridge {
     if (file) {
       await this.vault.modify(file, content);
     } else {
+      await ensureParentFolders(this.vault, vaultPath);
       await this.vault.create(vaultPath, content);
     }
   }
