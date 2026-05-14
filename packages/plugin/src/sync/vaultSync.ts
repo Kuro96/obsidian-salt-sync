@@ -1337,7 +1337,6 @@ export class VaultSyncEngine implements SyncEngine {
 
   private shouldDeferMissingKnownMarkdownDeletes(localMarkdownFileCount: number, missingKnownMarkdownPathCount: number): boolean {
     if (missingKnownMarkdownPathCount === 0) return false;
-    if (localMarkdownFileCount === 0) return true;
     return missingKnownMarkdownPathCount > MAX_RECONCILE_MISSING_KNOWN_MARKDOWN_DELETIONS
       && missingKnownMarkdownPathCount > localMarkdownFileCount;
   }

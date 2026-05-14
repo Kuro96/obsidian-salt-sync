@@ -2270,7 +2270,7 @@ describe('VaultSyncEngine', () => {
       expect(flushed).not.toContain('missing-after-restart.md');
     });
 
-    it('defers restart-missing tombstones when the local markdown scan is empty', async () => {
+    it('tombstones restart-missing markdown when the local markdown scan is empty', async () => {
       const plugin = new MockPlugin();
       const engine = new VaultSyncEngine(plugin as unknown as Plugin, baseSettings(), null);
       const { ydoc, pathToId, idToPath, docs, tombstones, knownLocalMarkdownPaths } = internals(engine);
@@ -2310,9 +2310,60 @@ describe('VaultSyncEngine', () => {
       await self.restoreMarkdownPending();
       await engine.reconcile();
 
-      expect(knownLocalMarkdownPaths.has('missing-while-empty.md')).toBe(true);
-      expect(tombstones.has('missing-while-empty.md')).toBe(false);
-      expect(pathToId.get('missing-while-empty.md')).toBe(fid);
+      expect(knownLocalMarkdownPaths.has('missing-while-empty.md')).toBe(false);
+      expect(tombstones.has('missing-while-empty.md')).toBe(true);
+      expect(tombstones.get('missing-while-empty.md')?.deleteSource).toBe('reconcile-missing');
+      expect(pathToId.has('missing-while-empty.md')).toBe(false);
+    });
+
+    it('defers restart-missing tombstones when an empty scan would delete many known markdown paths', async () => {
+      const plugin = new MockPlugin();
+      const engine = new VaultSyncEngine(plugin as unknown as Plugin, baseSettings(), null);
+      const { ydoc, pathToId, idToPath, docs, tombstones, knownLocalMarkdownPaths } = internals(engine);
+      const self = engine as unknown as {
+        bridge: {
+          markDirty: (path: string) => void;
+          drain: () => Promise<void>;
+          flushFile: (path: string) => Promise<void>;
+        };
+        markdownPendingStore: {
+          load: () => Promise<{ pendingLocalDeletions: string[]; knownLocalMarkdownPaths?: string[] } | null>;
+          save: (_key: string, state: { pendingLocalDeletions: string[]; knownLocalMarkdownPaths?: string[] }) => Promise<void>;
+        };
+        restoreMarkdownPending: () => Promise<void>;
+      };
+      const knownPaths = Array.from({ length: 25 }, (_, index) => `missing-while-empty-${index}.md`);
+      self.bridge = {
+        markDirty: () => {},
+        drain: async () => {},
+        flushFile: async () => {},
+      };
+      self.markdownPendingStore = {
+        load: async () => ({
+          pendingLocalDeletions: [],
+          knownLocalMarkdownPaths: knownPaths,
+          vaultId: 'test',
+          updatedAt: '',
+        }),
+        save: vi.fn(async () => {}),
+      };
+      ydoc.transact(() => {
+        for (const docPath of knownPaths) {
+          const fileId = `file-${docPath}`;
+          pathToId.set(docPath, fileId);
+          idToPath.set(fileId, docPath);
+          docs.set(fileId, new Y.Text());
+        }
+      });
+
+      await self.restoreMarkdownPending();
+      await engine.reconcile();
+
+      for (const docPath of knownPaths) {
+        expect(knownLocalMarkdownPaths.has(docPath)).toBe(true);
+        expect(tombstones.has(docPath)).toBe(false);
+        expect(pathToId.has(docPath)).toBe(true);
+      }
     });
 
     it('does not restore known local markdown paths from a different shared mount localPath', async () => {
