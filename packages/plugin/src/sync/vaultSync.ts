@@ -100,7 +100,7 @@ export class VaultSyncEngine implements SyncEngine {
   private bridge!: ObsidianFilesystemBridge;
   private blobSync!: BlobSync;
   /**
-   * 本设备在当前会话中确认过存在于本地磁盘的 markdown 路径。
+   * 本设备在当前或历史会话中确认过存在于本地磁盘的 markdown 路径。
    * 只对这些路径做“缺失即 tombstone”的补偿，避免新设备首同步时把
    * 纯远端文件误判成本地删除。
    */
@@ -737,8 +737,8 @@ export class VaultSyncEngine implements SyncEngine {
       console.warn(`[VaultSync] reconcile deferred ${missingKnownMarkdownPaths.length} missing known markdown paths because the local markdown scan looks incomplete (${this.mount?.localPath ?? 'primary'}; localFiles=${files.length})`);
       return;
     }
-    // Detect paths this session has confirmed locally, then later found absent.
-    // Only those in-session misses are treated as local deletions.
+    // Detect paths this device has confirmed locally, then later found absent.
+    // Only those known-local misses are treated as local deletions.
     for (const docPath of missingKnownMarkdownPaths) {
       this.handleLocalFileDeletion(docPath, 'reconcile-missing');
     }
@@ -1337,8 +1337,14 @@ export class VaultSyncEngine implements SyncEngine {
 
   private shouldDeferMissingKnownMarkdownDeletes(localMarkdownFileCount: number, missingKnownMarkdownPathCount: number): boolean {
     if (missingKnownMarkdownPathCount === 0) return false;
+    if (localMarkdownFileCount === 0) return this.isMountRootMissing();
     return missingKnownMarkdownPathCount > MAX_RECONCILE_MISSING_KNOWN_MARKDOWN_DELETIONS
       && missingKnownMarkdownPathCount > localMarkdownFileCount;
+  }
+
+  private isMountRootMissing(): boolean {
+    if (!this.mount) return false;
+    return !this.plugin.app.vault.getAbstractFileByPath(normalizeVaultPath(this.mount.localPath));
   }
 
   private bindAllOpenEditors(): void {
