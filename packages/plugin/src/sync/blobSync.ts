@@ -855,8 +855,10 @@ export class BlobSync {
 
       const localHash = await this.getLocalBlobHash(docPath, file);
       const before = this.knownLocalBlobs.get(docPath);
+      const hadKnownLocalPath = this.knownLocalPaths.has(docPath);
       this.rememberLocalBlob(docPath, localHash, file, file.stat.size);
-      if (before?.hash !== localHash || !this.knownLocalPaths.has(docPath)) knownLocalPathsChanged = true;
+      const after = this.knownLocalBlobs.get(docPath);
+      if (before?.hash !== localHash || before?.lastSeenAt !== after?.lastSeenAt || !hadKnownLocalPath) knownLocalPathsChanged = true;
       if (this.blobTombstones.has(docPath) && mode === 'authoritative') {
         if (this.pendingRemoteDeletes.has(docPath)) continue;
         await this.handleLocalBlobChange(docPath);

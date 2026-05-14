@@ -2341,6 +2341,51 @@ describe('BlobSync reconcile', () => {
     expect(vault.getFileByPath('assets/will-delete.png')).toBeNull();
   });
 
+  it('persists refreshed knownLocalBlobs timestamp when an unchanged blob is seen again', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-02T00:00:00.000Z'));
+    const vault = new MockVault();
+    const ydoc = new Y.Doc();
+    const bytes = new Uint8Array([1, 2, 4]);
+    const hash = sha256hex(bytes);
+    const oldLastSeenAt = '2026-01-01T00:00:00.000Z';
+    const runtime = createRuntimeStateStore();
+    await runtime.store.save('vault-a', {
+      vaultId: 'vault-a',
+      pendingRemoteDownloads: [],
+      pendingRemoteDeletes: [],
+      pendingLocalUpserts: [],
+      pendingLocalDeletions: [],
+      knownLocalPaths: ['assets/still-present.png'],
+      knownLocalBlobs: [{
+        docPath: 'assets/still-present.png',
+        hash,
+        lastSeenAt: oldLastSeenAt,
+      }],
+      updatedAt: oldLastSeenAt,
+    });
+
+    vault.seedBinary('assets/still-present.png', bytes);
+    (ydoc.getMap('pathToBlob') as Y.Map<{ hash: string; size: number; updatedAt: string }>).set(
+      'assets/still-present.png',
+      { hash, size: bytes.byteLength, updatedAt: oldLastSeenAt },
+    );
+
+    const sync = new BlobSync(
+      'ws://server.test', 'vault-a', 'token-a', vault as never, ydoc,
+      undefined, undefined, undefined, runtime.store,
+    );
+    await sync.restoreRuntimeState();
+    await sync.reconcile('authoritative');
+    await sync.flushPersistChain();
+
+    expect(runtime.snapshot()?.knownLocalBlobs?.[0]).toMatchObject({
+      docPath: 'assets/still-present.png',
+      hash,
+      lastSeenAt: '2026-01-02T00:00:00.000Z',
+    });
+  });
+
   it('known local baseline is cleared when tombstone is committed', async () => {
     const vault = new MockVault();
     const ydoc = new Y.Doc();
