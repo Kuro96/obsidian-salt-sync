@@ -48,6 +48,7 @@ describe('BlobSync reconcile', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
   });
 
@@ -537,7 +538,6 @@ describe('BlobSync reconcile', () => {
       const hash = sha256hex(bytes);
       vault.seedBinary('assets/image.png', bytes);
 
-      // Directly set pathToBlob to avoid real upload through handleLocalBlobChange
       (ydoc.getMap('pathToBlob') as Y.Map<{ hash: string; size: number; updatedAt: string }>).set('assets/image.png', {
         hash,
         size: bytes.byteLength,
@@ -561,12 +561,12 @@ describe('BlobSync reconcile', () => {
         'Test Device',
       );
 
+      await sync.reconcile('authoritative');
       await sync.openRemoteApplyGate();
 
       // Now delete the file locally
       await vault.delete(vault.getFileByPath('assets/image.png')!);
       await sync.handleLocalBlobDeletion('assets/image.png');
-      await sync.flushPendingLocalDeletions();
 
       const tombstones = ydoc.getMap('blobTombstones') as Y.Map<{ hash: string; deletedAt: string; deviceId?: string; deviceName?: string; vaultId?: string; deleteSource?: string }>;
       expect(tombstones.has('assets/image.png')).toBe(true);
@@ -584,6 +584,15 @@ describe('BlobSync reconcile', () => {
       const bytes = new Uint8Array([9, 9, 9]);
       const hash = sha256hex(bytes);
       (ydoc.getMap('pathToBlob') as Y.Map<{ hash: string }>).set('assets/pending.png', { hash });
+      const runtime = createRuntimeStateStore();
+      await runtime.store.save('vault-b', {
+        vaultId: 'vault-b',
+        pendingRemoteDownloads: [],
+        pendingRemoteDeletes: [],
+        pendingLocalUpserts: [],
+        pendingLocalDeletions: [{ docPath: 'assets/pending.png', hash }],
+        updatedAt: new Date().toISOString(),
+      });
 
       const sync = new BlobSync(
         'ws://server.test',
@@ -594,7 +603,7 @@ describe('BlobSync reconcile', () => {
         (p) => p,
         (p) => p,
         () => true,
-        null,
+        runtime.store,
         'vault-b',
         undefined,
         () => false,
@@ -602,9 +611,8 @@ describe('BlobSync reconcile', () => {
         'Another Device',
       );
 
-      // Simulate a pending deletion that gets flushed
-      await sync.handleLocalBlobDeletion('assets/pending.png');
-      await sync.flushPendingLocalDeletions();
+      await sync.restoreRuntimeState();
+      await sync.openRemoteApplyGate();
 
       const tombstones = ydoc.getMap('blobTombstones') as Y.Map<{ hash: string; deviceId?: string; vaultId?: string; deleteSource?: string }>;
       expect(tombstones.has('assets/pending.png')).toBe(true);
@@ -938,7 +946,7 @@ describe('BlobSync reconcile', () => {
     });
   });
 
-  it('tracks pending local deletion when ref is absent and flushes tombstone when ref arrives later', async () => {
+  it('tracks pending local deletion with null hash without borrowing a later remote ref hash', async () => {
     const vault = new MockVault();
     const ydoc = new Y.Doc();
     const bytes = new Uint8Array([3, 1, 4]);
@@ -972,7 +980,7 @@ describe('BlobSync reconcile', () => {
       { docPath: 'assets/startup-delete.png', hash: null },
     ]);
 
-    // 服务端随后推来 pathToBlob → handleRemoteBlobChanges 在 flush 前会先尝试处理 pending deletion。
+    // 服务端随后推来 pathToBlob；null-hash pending 不能借用 remote ref hash 写 tombstone。
     let remoteTxn: Y.Transaction | null = null;
     ydoc.on('afterTransaction', (txn) => {
       if (txn.origin === 'remote') remoteTxn = txn;
@@ -986,13 +994,21 @@ describe('BlobSync reconcile', () => {
     }, 'remote');
     await sync.handleRemoteBlobChanges(remoteTxn!);
 
-    expect((ydoc.getMap('blobTombstones') as Y.Map<{ hash: string }>).get('assets/startup-delete.png')?.hash).toBe(hash);
+    expect((ydoc.getMap('blobTombstones') as Y.Map<unknown>).has('assets/startup-delete.png')).toBe(false);
+    expect((ydoc.getMap('pathToBlob') as Y.Map<unknown>).has('assets/startup-delete.png')).toBe(true);
     expect(vault.getFileByPath('assets/startup-delete.png')).toBeNull();
     expect(fetchMock).not.toHaveBeenCalled();
-    expect(runtime.snapshot()).toBeNull();
+    expect(runtime.snapshot()?.pendingLocalDeletions).toEqual([
+      { docPath: 'assets/startup-delete.png', hash: null },
+    ]);
+    expect(runtime.snapshot()?.pendingMissingBlobs?.[0]).toMatchObject({
+      docPath: 'assets/startup-delete.png',
+      remoteHashAtCreation: hash,
+      reason: 'pending-null-hash',
+    });
   });
 
-  it('writes tombstone immediately when deletion sees an existing ref', async () => {
+  it('writes tombstone immediately when deletion has matching local hash evidence', async () => {
     const vault = new MockVault();
     const ydoc = new Y.Doc();
     const bytes = new Uint8Array([9, 0, 9]);
@@ -1017,6 +1033,9 @@ describe('BlobSync reconcile', () => {
       runtime.store,
     );
 
+    await sync.reconcile('authoritative');
+    await sync.flushPersistChain();
+
     // Phase 9：deletion 入队列串行执行，调用方必须 await 以便断言 tombstone 已写入。
     await vault.delete(vault.getFileByPath('assets/existing.png')!);
     await sync.handleLocalBlobDeletion('assets/existing.png');
@@ -1026,7 +1045,46 @@ describe('BlobSync reconcile', () => {
     expect(runtime.snapshot()).toBeNull();
   });
 
-  it('restores pending local deletions and flushes them once ref is available after reload', async () => {
+  it('does not tombstone a missing local blob by borrowing the current remote ref hash', async () => {
+    const vault = new MockVault();
+    const ydoc = new Y.Doc();
+    const bytes = new Uint8Array([9, 0, 8]);
+    const hash = sha256hex(bytes);
+    const file = vault.seedBinary('assets/no-local-evidence.png', bytes);
+    const runtime = createRuntimeStateStore();
+    (ydoc.getMap('pathToBlob') as Y.Map<{ hash: string; size: number; updatedAt: string }>).set('assets/no-local-evidence.png', {
+      hash,
+      size: bytes.byteLength,
+      updatedAt: new Date().toISOString(),
+    });
+
+    const sync = new BlobSync(
+      'ws://server.test',
+      'vault-a',
+      'token-a',
+      vault as never,
+      ydoc,
+      undefined,
+      undefined,
+      undefined,
+      runtime.store,
+    );
+
+    await vault.delete(file);
+    await sync.handleLocalBlobDeletion('assets/no-local-evidence.png');
+    await sync.flushPersistChain();
+
+    expect((ydoc.getMap('pathToBlob') as Y.Map<unknown>).has('assets/no-local-evidence.png')).toBe(true);
+    expect((ydoc.getMap('blobTombstones') as Y.Map<unknown>).has('assets/no-local-evidence.png')).toBe(false);
+    expect(runtime.snapshot()?.pendingLocalDeletions).toEqual([{ docPath: 'assets/no-local-evidence.png', hash: null }]);
+    expect(runtime.snapshot()?.pendingMissingBlobs?.[0]).toMatchObject({
+      docPath: 'assets/no-local-evidence.png',
+      remoteHashAtCreation: hash,
+      reason: 'pending-null-hash',
+    });
+  });
+
+  it('restores null-hash pending local deletions without tombstoning when ref arrives after reload', async () => {
     const bytes = new Uint8Array([2, 7, 1]);
     const hash = sha256hex(bytes);
     const runtime = createRuntimeStateStore();
@@ -1047,7 +1105,7 @@ describe('BlobSync reconcile', () => {
     );
     await firstVault.delete(file);
     await firstSync.handleLocalBlobDeletion('assets/lost.png');
-    expect(runtime.snapshot()?.pendingLocalDeletions).toEqual([{ docPath: 'assets/lost.png', hash: null }]);
+    expect(runtime.snapshot()?.pendingLocalDeletions?.[0]).toMatchObject({ docPath: 'assets/lost.png', hash: null });
 
     // 模拟重启：全新 ydoc 与 vault，仅有 runtime 状态。
     const secondVault = new MockVault();
@@ -1067,9 +1125,9 @@ describe('BlobSync reconcile', () => {
     await restoredSync.openRemoteApplyGate();
 
     // 此时还没有 ref，pending 应该保留。
-    expect(runtime.snapshot()?.pendingLocalDeletions).toEqual([{ docPath: 'assets/lost.png', hash: null }]);
+    expect(runtime.snapshot()?.pendingLocalDeletions?.[0]).toMatchObject({ docPath: 'assets/lost.png', hash: null });
 
-    // 服务端随后推来 pathToBlob → 依据 ref.hash 写 tombstone。
+    // 服务端随后推来 pathToBlob；null-hash pending 只能 quarantine，不能依据 ref.hash 写 tombstone。
     let remoteTxn: Y.Transaction | null = null;
     ydoc2.on('afterTransaction', (txn) => {
       if (txn.origin === 'remote') remoteTxn = txn;
@@ -1083,8 +1141,14 @@ describe('BlobSync reconcile', () => {
     }, 'remote');
     await restoredSync.handleRemoteBlobChanges(remoteTxn!);
 
-    expect((ydoc2.getMap('blobTombstones') as Y.Map<{ hash: string }>).get('assets/lost.png')?.hash).toBe(hash);
-    expect(runtime.snapshot()).toBeNull();
+    expect((ydoc2.getMap('blobTombstones') as Y.Map<unknown>).has('assets/lost.png')).toBe(false);
+    expect((ydoc2.getMap('pathToBlob') as Y.Map<unknown>).has('assets/lost.png')).toBe(true);
+    expect(runtime.snapshot()?.pendingLocalDeletions?.[0]).toMatchObject({ docPath: 'assets/lost.png', hash: null });
+    expect(runtime.snapshot()?.pendingMissingBlobs?.[0]).toMatchObject({
+      docPath: 'assets/lost.png',
+      remoteHashAtCreation: hash,
+      reason: 'pending-null-hash',
+    });
   });
 
   it('drops orphan pending local deletions when no remote ref or hash exists after reconcile', async () => {
@@ -1120,6 +1184,421 @@ describe('BlobSync reconcile', () => {
     await sync.flushPersistChain();
 
     expect(sync.getPendingBlobItems()).toEqual([]);
+    expect(runtime.snapshot()).toBeNull();
+  });
+
+  it('does not create a tombstone when pending local deletion has hash but no current remote ref', async () => {
+    const runtime = createRuntimeStateStore();
+    const hash = sha256hex(new Uint8Array([9, 9, 1]));
+    await runtime.store.save('vault-a', {
+      vaultId: 'vault-a',
+      pendingRemoteDownloads: [],
+      pendingRemoteDeletes: [],
+      pendingLocalUpserts: [],
+      pendingLocalDeletions: [{ docPath: 'assets/no-ref.png', hash }],
+      updatedAt: new Date().toISOString(),
+    });
+
+    const vault = new MockVault();
+    const ydoc = new Y.Doc();
+    const sync = new BlobSync(
+      'ws://server.test',
+      'vault-a',
+      'token-a',
+      vault as never,
+      ydoc,
+      undefined,
+      undefined,
+      undefined,
+      runtime.store,
+    );
+
+    await sync.restoreRuntimeState();
+    await sync.openRemoteApplyGate();
+    await sync.reconcile('authoritative');
+
+    expect((ydoc.getMap('blobTombstones') as Y.Map<unknown>).has('assets/no-ref.png')).toBe(false);
+    expect(runtime.snapshot()?.pendingLocalDeletions?.[0]).toMatchObject({ docPath: 'assets/no-ref.png', hash });
+  });
+
+  it('preserves newer remote blob when pending local deletion hash is stale', async () => {
+    const oldHash = sha256hex(new Uint8Array([1, 0, 0]));
+    const newBytes = new Uint8Array([2, 0, 0]);
+    const newHash = sha256hex(newBytes);
+    const runtime = createRuntimeStateStore();
+    await runtime.store.save('vault-a', {
+      vaultId: 'vault-a',
+      pendingRemoteDownloads: [],
+      pendingRemoteDeletes: [],
+      pendingLocalUpserts: [],
+      pendingLocalDeletions: [{ docPath: 'assets/recreated.png', hash: oldHash }],
+      updatedAt: new Date().toISOString(),
+    });
+
+    const vault = new MockVault();
+    const ydoc = new Y.Doc();
+    (ydoc.getMap('pathToBlob') as Y.Map<{ hash: string; size: number; updatedAt: string }>).set('assets/recreated.png', {
+      hash: newHash,
+      size: newBytes.byteLength,
+      updatedAt: new Date().toISOString(),
+    });
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.endsWith(`/blobs/${newHash}`)) return binaryResponse(newBytes);
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const sync = new BlobSync(
+      'ws://server.test',
+      'vault-a',
+      'token-a',
+      vault as never,
+      ydoc,
+      undefined,
+      undefined,
+      undefined,
+      runtime.store,
+    );
+
+    await sync.restoreRuntimeState();
+    await sync.reconcile('authoritative');
+
+    expect((ydoc.getMap('blobTombstones') as Y.Map<unknown>).has('assets/recreated.png')).toBe(false);
+    const file = vault.getFileByPath('assets/recreated.png');
+    expect(file).not.toBeNull();
+    expect(new Uint8Array(await vault.readBinary(file!))).toEqual(newBytes);
+    expect(runtime.snapshot()?.pendingLocalDeletions ?? []).toEqual([]);
+  });
+
+  it('downloads current remote blob after null-hash deletion candidate expires', async () => {
+    const bytes = new Uint8Array([6, 2, 6]);
+    const hash = sha256hex(bytes);
+    const runtime = createRuntimeStateStore();
+    await runtime.store.save('vault-a', {
+      vaultId: 'vault-a',
+      pendingRemoteDownloads: [],
+      pendingRemoteDeletes: [],
+      pendingLocalUpserts: [],
+      pendingLocalDeletions: [{ docPath: 'assets/expired.png', hash: null }],
+      pendingMissingBlobs: [{
+        docPath: 'assets/expired.png',
+        remoteHashAtCreation: hash,
+        firstSeenAt: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
+        reason: 'pending-null-hash',
+      }],
+      updatedAt: new Date().toISOString(),
+    });
+
+    const vault = new MockVault();
+    const ydoc = new Y.Doc();
+    (ydoc.getMap('pathToBlob') as Y.Map<{ hash: string; size: number; updatedAt: string }>).set('assets/expired.png', {
+      hash,
+      size: bytes.byteLength,
+      updatedAt: new Date().toISOString(),
+    });
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.endsWith(`/blobs/${hash}`)) return binaryResponse(bytes);
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const sync = new BlobSync(
+      'ws://server.test',
+      'vault-a',
+      'token-a',
+      vault as never,
+      ydoc,
+      undefined,
+      undefined,
+      undefined,
+      runtime.store,
+    );
+
+    await sync.restoreRuntimeState();
+    await sync.reconcile('authoritative');
+
+    expect((ydoc.getMap('blobTombstones') as Y.Map<unknown>).has('assets/expired.png')).toBe(false);
+    const file = vault.getFileByPath('assets/expired.png');
+    expect(file).not.toBeNull();
+    expect(new Uint8Array(await vault.readBinary(file!))).toEqual(bytes);
+    expect(runtime.snapshot()?.pendingMissingBlobs ?? []).toEqual([]);
+  });
+
+  it('actively downloads a candidate when its TTL expires without another reconcile', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+    const vault = new MockVault();
+    const ydoc = new Y.Doc();
+    const bytes = new Uint8Array([6, 3, 6]);
+    const hash = sha256hex(bytes);
+    const file = vault.seedBinary('assets/active-expiry.png', bytes);
+    const runtime = createRuntimeStateStore();
+
+    const sync = new BlobSync(
+      'ws://server.test',
+      'vault-a',
+      'token-a',
+      vault as never,
+      ydoc,
+      undefined,
+      undefined,
+      undefined,
+      runtime.store,
+    );
+
+    await vault.delete(file);
+    await sync.handleLocalBlobDeletion('assets/active-expiry.png');
+
+    let remoteTxn: Y.Transaction | null = null;
+    ydoc.on('afterTransaction', (txn) => {
+      if (txn.origin === 'remote') remoteTxn = txn;
+    });
+    ydoc.transact(() => {
+      (ydoc.getMap('pathToBlob') as Y.Map<{ hash: string; size: number; updatedAt: string }>).set('assets/active-expiry.png', {
+        hash,
+        size: bytes.byteLength,
+        updatedAt: new Date().toISOString(),
+      });
+    }, 'remote');
+    await sync.handleRemoteBlobChanges(remoteTxn!);
+    await sync.openRemoteApplyGate();
+
+    expect(vault.getFileByPath('assets/active-expiry.png')).toBeNull();
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.endsWith(`/blobs/${hash}`)) return binaryResponse(bytes);
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+    await sync.flushPersistChain();
+
+    const restored = vault.getFileByPath('assets/active-expiry.png');
+    expect(restored).not.toBeNull();
+    expect(new Uint8Array(await vault.readBinary(restored!))).toEqual(bytes);
+    expect(runtime.snapshot()?.pendingLocalDeletions ?? []).toEqual([]);
+    expect(runtime.snapshot()?.pendingMissingBlobs ?? []).toEqual([]);
+    expect(runtime.snapshot()?.pendingRemoteDownloads ?? []).toEqual([]);
+    expect(sync.getPendingBlobItems()).toEqual([]);
+  });
+
+  it('keeps expired candidate state when its fallback download fails', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+    const vault = new MockVault();
+    const ydoc = new Y.Doc();
+    const bytes = new Uint8Array([6, 4, 6]);
+    const hash = sha256hex(bytes);
+    const file = vault.seedBinary('assets/expiry-fail.png', bytes);
+    const runtime = createRuntimeStateStore();
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const sync = new BlobSync(
+      'ws://server.test',
+      'vault-a',
+      'token-a',
+      vault as never,
+      ydoc,
+      undefined,
+      undefined,
+      undefined,
+      runtime.store,
+    );
+
+    await vault.delete(file);
+    await sync.handleLocalBlobDeletion('assets/expiry-fail.png');
+
+    let remoteTxn: Y.Transaction | null = null;
+    ydoc.on('afterTransaction', (txn) => {
+      if (txn.origin === 'remote') remoteTxn = txn;
+    });
+    ydoc.transact(() => {
+      (ydoc.getMap('pathToBlob') as Y.Map<{ hash: string; size: number; updatedAt: string }>).set('assets/expiry-fail.png', {
+        hash,
+        size: bytes.byteLength,
+        updatedAt: new Date().toISOString(),
+      });
+    }, 'remote');
+    await sync.handleRemoteBlobChanges(remoteTxn!);
+    await sync.openRemoteApplyGate();
+
+    fetchMock.mockImplementation(async () => {
+      throw new Error('simulated download failure');
+    });
+
+    await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+    await sync.flushPersistChain();
+
+    expect(vault.getFileByPath('assets/expiry-fail.png')).toBeNull();
+    expect(runtime.snapshot()?.pendingLocalDeletions).toEqual([{ docPath: 'assets/expiry-fail.png', hash: null }]);
+    expect(runtime.snapshot()?.pendingMissingBlobs?.[0]).toMatchObject({
+      docPath: 'assets/expiry-fail.png',
+      remoteHashAtCreation: hash,
+      reason: 'pending-null-hash',
+    });
+    expect(runtime.snapshot()?.pendingRemoteDownloads).toEqual([{ docPath: 'assets/expiry-fail.png', hash }]);
+    expect(sync.getPendingBlobItems()).toEqual(expect.arrayContaining([
+      { kind: 'download', path: 'assets/expiry-fail.png', hash, size: bytes.byteLength, contentType: undefined },
+      { kind: 'local-delete', path: 'assets/expiry-fail.png', hash: null },
+    ]));
+    expect(consoleError).toHaveBeenCalledWith(
+      '[BlobSync] expired missing blob candidate download failed:',
+      expect.any(Error),
+    );
+    consoleError.mockRestore();
+  });
+
+  it('does not overwrite a local file that reappears while an expired candidate is queued', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+    const vault = new MockVault();
+    const ydoc = new Y.Doc();
+    const remoteBytes = new Uint8Array([1, 2, 1]);
+    const localBytes = new Uint8Array([9, 8, 9]);
+    const remoteHash = sha256hex(remoteBytes);
+    const file = vault.seedBinary('assets/reappears.png', remoteBytes);
+    const runtime = createRuntimeStateStore();
+
+    const sync = new BlobSync(
+      'ws://server.test',
+      'vault-a',
+      'token-a',
+      vault as never,
+      ydoc,
+      undefined,
+      undefined,
+      undefined,
+      runtime.store,
+    );
+
+    await vault.delete(file);
+    await sync.handleLocalBlobDeletion('assets/reappears.png');
+
+    let remoteTxn: Y.Transaction | null = null;
+    ydoc.on('afterTransaction', (txn) => {
+      if (txn.origin === 'remote') remoteTxn = txn;
+    });
+    ydoc.transact(() => {
+      (ydoc.getMap('pathToBlob') as Y.Map<{ hash: string; size: number; updatedAt: string }>).set('assets/reappears.png', {
+        hash: remoteHash,
+        size: remoteBytes.byteLength,
+        updatedAt: new Date().toISOString(),
+      });
+    }, 'remote');
+    await sync.handleRemoteBlobChanges(remoteTxn!);
+    await sync.openRemoteApplyGate();
+
+    const originalGetAbstractFileByPath = vault.getAbstractFileByPath.bind(vault);
+    let seededDuringExpiry = false;
+    vi.spyOn(vault, 'getAbstractFileByPath').mockImplementation((path: string) => {
+      const existing = originalGetAbstractFileByPath(path);
+      if (path === 'assets/reappears.png' && !existing && !seededDuringExpiry) {
+        seededDuringExpiry = true;
+        vault.seedBinary(path, localBytes);
+        return null;
+      }
+      return existing;
+    });
+    fetchMock.mockImplementation(async () => {
+      throw new Error('should not download over a reappeared local file');
+    });
+
+    await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+    await sync.flushPersistChain();
+
+    const reappeared = vault.getFileByPath('assets/reappears.png');
+    expect(reappeared).not.toBeNull();
+    expect(new Uint8Array(await vault.readBinary(reappeared!))).toEqual(localBytes);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('does not tombstone with a stale matching knownLocalBlobs baseline', async () => {
+    const bytes = new Uint8Array([4, 8, 4]);
+    const hash = sha256hex(bytes);
+    const runtime = createRuntimeStateStore();
+    await runtime.store.save('vault-a', {
+      vaultId: 'vault-a',
+      pendingRemoteDownloads: [],
+      pendingRemoteDeletes: [],
+      pendingLocalUpserts: [],
+      pendingLocalDeletions: [],
+      knownLocalPaths: ['assets/stale-baseline.png'],
+      knownLocalBlobs: [{
+        docPath: 'assets/stale-baseline.png',
+        hash,
+        lastSeenAt: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(),
+      }],
+      updatedAt: new Date().toISOString(),
+    });
+
+    const vault = new MockVault();
+    const ydoc = new Y.Doc();
+    (ydoc.getMap('pathToBlob') as Y.Map<{ hash: string; size: number; updatedAt: string }>).set('assets/stale-baseline.png', {
+      hash,
+      size: bytes.byteLength,
+      updatedAt: new Date().toISOString(),
+    });
+
+    const sync = new BlobSync(
+      'ws://server.test',
+      'vault-a',
+      'token-a',
+      vault as never,
+      ydoc,
+      undefined,
+      undefined,
+      undefined,
+      runtime.store,
+    );
+
+    await sync.restoreRuntimeState();
+    await sync.reconcile('authoritative');
+    await sync.flushPersistChain();
+
+    expect((ydoc.getMap('blobTombstones') as Y.Map<unknown>).has('assets/stale-baseline.png')).toBe(false);
+    expect((ydoc.getMap('pathToBlob') as Y.Map<unknown>).has('assets/stale-baseline.png')).toBe(true);
+    expect(runtime.snapshot()?.pendingMissingBlobs?.[0]).toMatchObject({
+      docPath: 'assets/stale-baseline.png',
+      remoteHashAtCreation: hash,
+      reason: 'stale-baseline',
+    });
+  });
+
+  it('expires concrete-hash pending local deletions that never get a current remote ref', async () => {
+    const runtime = createRuntimeStateStore();
+    const hash = sha256hex(new Uint8Array([1, 9, 1]));
+    await runtime.store.save('vault-a', {
+      vaultId: 'vault-a',
+      pendingRemoteDownloads: [],
+      pendingRemoteDeletes: [],
+      pendingLocalUpserts: [],
+      pendingLocalDeletions: [{
+        docPath: 'assets/expired-no-ref.png',
+        hash,
+        firstSeenAt: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(),
+      }],
+      updatedAt: new Date().toISOString(),
+    });
+
+    const vault = new MockVault();
+    const ydoc = new Y.Doc();
+    const sync = new BlobSync(
+      'ws://server.test',
+      'vault-a',
+      'token-a',
+      vault as never,
+      ydoc,
+      undefined,
+      undefined,
+      undefined,
+      runtime.store,
+    );
+
+    await sync.restoreRuntimeState();
+    await sync.reconcile('authoritative');
+    await sync.flushPersistChain();
+
+    expect((ydoc.getMap('blobTombstones') as Y.Map<unknown>).has('assets/expired-no-ref.png')).toBe(false);
     expect(runtime.snapshot()).toBeNull();
   });
 
@@ -1168,7 +1647,7 @@ describe('BlobSync reconcile', () => {
     expect((ydoc.getMap('blobTombstones') as Y.Map<unknown>).has('assets/old-mount.png')).toBe(false);
   });
 
-  it('restores pending local deletions saved for the same shared mount localPath', async () => {
+  it('restores null-hash pending local deletions for the same shared mount without borrowing remote hash', async () => {
     const bytes = new Uint8Array([4, 2, 1]);
     const hash = sha256hex(bytes);
     const runtime = createRuntimeStateStore();
@@ -1208,9 +1687,9 @@ describe('BlobSync reconcile', () => {
     await sync.restoreRuntimeState();
     await sync.openRemoteApplyGate();
 
-    expect((ydoc.getMap('pathToBlob') as Y.Map<unknown>).has('assets/same-mount.png')).toBe(false);
-    expect((ydoc.getMap('blobTombstones') as Y.Map<{ hash: string }>).get('assets/same-mount.png')?.hash).toBe(hash);
-    expect(sync.pendingLocalDeletionCount).toBe(0);
+    expect((ydoc.getMap('pathToBlob') as Y.Map<unknown>).has('assets/same-mount.png')).toBe(true);
+    expect((ydoc.getMap('blobTombstones') as Y.Map<unknown>).has('assets/same-mount.png')).toBe(false);
+    expect(sync.pendingLocalDeletionCount).toBe(1);
   });
 
   it('drops pending deletion if the file reappears before flush', async () => {
@@ -1346,8 +1825,7 @@ describe('BlobSync reconcile', () => {
     await deletionPromise;
 
     expect((ydoc.getMap('pathToBlob') as Y.Map<unknown>).has('assets/race.png')).toBe(false);
-    const tomb = (ydoc.getMap('blobTombstones') as Y.Map<{ hash: string }>).get('assets/race.png');
-    expect(tomb?.hash).toBe(hash);
+    expect((ydoc.getMap('blobTombstones') as Y.Map<unknown>).has('assets/race.png')).toBe(false);
   });
 
   it('delete after completed upsert writes tombstone without being undone', async () => {
@@ -1593,11 +2071,8 @@ describe('BlobSync reconcile', () => {
     await sync.flushPersistChain();
 
     expect((ydoc.getMap('pathToBlob') as Y.Map<unknown>).has('assets/combo.png')).toBe(false);
-    expect(
-      (ydoc.getMap('blobTombstones') as Y.Map<{ hash: string }>).get('assets/combo.png')?.hash,
-    ).toBe(hash);
-    // 顺序性：最后一次 persist 产出空状态 → 最终结果是 null（clear）。
-    expect(runtime.snapshot()).toBeNull();
+    expect((ydoc.getMap('blobTombstones') as Y.Map<unknown>).has('assets/combo.png')).toBe(false);
+    expect(runtime.snapshot()?.pendingLocalDeletions?.[0]).toMatchObject({ docPath: 'assets/combo.png', hash });
   });
 
   it('combines Phase 8 startup deletion with Phase 10 tombstone short-circuit', async () => {
@@ -1813,10 +2288,10 @@ describe('BlobSync reconcile', () => {
     consoleError.mockRestore();
   });
 
-  it('detects missed local deletion even when hashCache is empty (cross-session)', async () => {
-    // Scenario: blob was present on device in a previous session (knownLocalPaths persisted),
+  it('detects missed local deletion when hash-aware baseline matches remote ref (cross-session)', async () => {
+    // Scenario: blob was present on device in a previous session (knownLocalBlobs persisted),
     // then deleted while the plugin was stopped.  On restart hashCache is empty.
-    // Without knownLocalPaths, isMissingLocalBlob would return false and re-download the file.
+    // The matching baseline hash proves the missing local file is the same remote blob.
     const vault = new MockVault();
     const ydoc = new Y.Doc();
     const bytes = new Uint8Array([1, 2, 3]);
@@ -1834,19 +2309,23 @@ describe('BlobSync reconcile', () => {
       'ws://server.test', 'vault-a', 'token-a', vault as never, ydoc,
       undefined, undefined, undefined, runtime.store,
     );
-    await sync1.reconcile('authoritative'); // populates knownLocalPaths
+    await sync1.reconcile('authoritative'); // populates knownLocalBlobs
     await sync1.flushPersistChain();
     expect(runtime.snapshot()?.knownLocalPaths).toContain('assets/will-delete.png');
+    expect(runtime.snapshot()?.knownLocalBlobs?.[0]).toMatchObject({
+      docPath: 'assets/will-delete.png',
+      hash,
+    });
 
     // ── Between sessions: file is deleted from vault ──
     await vault.delete(vault.getFileByPath('assets/will-delete.png')!);
 
-    // ── Session 2: hashCache is empty (new instance), but knownLocalPaths restored ──
+    // ── Session 2: hashCache is empty (new instance), but knownLocalBlobs restored ──
     const sync2 = new BlobSync(
       'ws://server.test', 'vault-a', 'token-a', vault as never, ydoc,
       undefined, undefined, undefined, runtime.store,
     );
-    await sync2.restoreRuntimeState(); // restores knownLocalPaths
+    await sync2.restoreRuntimeState(); // restores knownLocalBlobs
 
     // No network calls expected — should tombstone, not download
     fetchMock.mockImplementation(async () => {
@@ -1862,7 +2341,7 @@ describe('BlobSync reconcile', () => {
     expect(vault.getFileByPath('assets/will-delete.png')).toBeNull();
   });
 
-  it('knownLocalPaths is cleared when tombstone is committed', async () => {
+  it('known local baseline is cleared when tombstone is committed', async () => {
     const vault = new MockVault();
     const ydoc = new Y.Doc();
     const bytes = new Uint8Array([5, 5, 5]);
@@ -1879,18 +2358,23 @@ describe('BlobSync reconcile', () => {
       'ws://server.test', 'vault-a', 'token-a', vault as never, ydoc,
       undefined, undefined, undefined, runtime.store,
     );
-    await sync.reconcile('authoritative'); // file present → added to knownLocalPaths
+    await sync.reconcile('authoritative'); // file present → added to knownLocalBlobs
     await sync.flushPersistChain();
     expect(runtime.snapshot()?.knownLocalPaths).toContain('assets/to-tombstone.png');
+    expect(runtime.snapshot()?.knownLocalBlobs?.[0]).toMatchObject({
+      docPath: 'assets/to-tombstone.png',
+      hash,
+    });
 
     // Delete the file and write tombstone via handleLocalBlobDeletion
     await vault.delete(vault.getFileByPath('assets/to-tombstone.png')!);
     await sync.handleLocalBlobDeletion('assets/to-tombstone.png');
     await sync.flushPersistChain();
 
-    // knownLocalPaths should no longer include the path after tombstone is written
+    // knownLocalPaths / knownLocalBlobs should no longer include the path after tombstone is written
     const snap = runtime.snapshot();
     expect(snap?.knownLocalPaths ?? []).not.toContain('assets/to-tombstone.png');
+    expect(snap?.knownLocalBlobs ?? []).not.toContainEqual(expect.objectContaining({ docPath: 'assets/to-tombstone.png' }));
   });
 });
 
@@ -1965,7 +2449,7 @@ describe('BlobSync localPath guard (Bug 2: mount path change)', () => {
     expect(file).not.toBeNull();
   });
 
-  it('restores knownLocalPaths normally when localPath is unchanged', async () => {
+  it('treats path-only knownLocalPaths as weak evidence when localPath is unchanged', async () => {
     const bytes = new Uint8Array([4, 5, 6]);
     const hash = sha256hex(bytes);
     const runtime = createRuntimeStateStore();
@@ -1982,13 +2466,18 @@ describe('BlobSync localPath guard (Bug 2: mount path change)', () => {
       updatedAt: new Date().toISOString(),
     });
 
-    // New session: file was deleted while plugin was stopped, SharedDir still same path
+    // New session with only legacy path baseline: file absence is weak evidence, so remote wins/downloads.
     const vault = new MockVault();
     const ydoc = new Y.Doc();
     (ydoc.getMap('pathToBlob') as Y.Map<{ hash: string; size: number; updatedAt: string }>).set('photo.png', {
       hash,
       size: bytes.byteLength,
       updatedAt: new Date().toISOString(),
+    });
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.endsWith(`/blobs/${hash}`)) return binaryResponse(bytes);
+      throw new Error(`unexpected fetch: ${url}`);
     });
 
     // New engine with same localPath = 'SharedDir'
@@ -2009,16 +2498,15 @@ describe('BlobSync localPath guard (Bug 2: mount path change)', () => {
     await sync.restoreRuntimeState();
     await sync.reconcile('authoritative');
 
-    // knownLocalPaths WAS restored (same path) → file not on disk → treated as deleted → tombstone
-    const blobTombstones = ydoc.getMap('blobTombstones') as Y.Map<{ hash: string }>;
-    expect(blobTombstones.get('photo.png')?.hash).toBe(hash);
+    const blobTombstones = ydoc.getMap('blobTombstones') as Y.Map<unknown>;
+    expect(blobTombstones.has('photo.png')).toBe(false);
 
-    // File should not be re-downloaded
-    expect(vault.getFileByPath('SharedDir/photo.png')).toBeNull();
-    expect(fetchMock).not.toHaveBeenCalled();
+    const file = vault.getFileByPath('SharedDir/photo.png');
+    expect(file).not.toBeNull();
+    expect(new Uint8Array(await vault.readBinary(file!))).toEqual(bytes);
   });
 
-  it('primary vault (localPath undefined) behaves as before — knownLocalPaths restored', async () => {
+  it('primary vault path-only knownLocalPaths downloads instead of tombstoning', async () => {
     const bytes = new Uint8Array([7, 8, 9]);
     const hash = sha256hex(bytes);
     const runtime = createRuntimeStateStore();
@@ -2043,6 +2531,12 @@ describe('BlobSync localPath guard (Bug 2: mount path change)', () => {
       updatedAt: new Date().toISOString(),
     });
 
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.endsWith(`/blobs/${hash}`)) return binaryResponse(bytes);
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
     // Primary vault BlobSync: no localPath param
     const sync = new BlobSync(
       'ws://server.test',
@@ -2061,9 +2555,117 @@ describe('BlobSync localPath guard (Bug 2: mount path change)', () => {
     await sync.restoreRuntimeState();
     await sync.reconcile('authoritative');
 
-    // Primary vault: undefined === undefined → knownLocalPaths restored → file missing → tombstone
-    const blobTombstones = ydoc.getMap('blobTombstones') as Y.Map<{ hash: string }>;
-    expect(blobTombstones.get('assets/note.png')?.hash).toBe(hash);
+    const blobTombstones = ydoc.getMap('blobTombstones') as Y.Map<unknown>;
+    expect(blobTombstones.has('assets/note.png')).toBe(false);
+    const file = vault.getFileByPath('assets/note.png');
+    expect(file).not.toBeNull();
+    expect(new Uint8Array(await vault.readBinary(file!))).toEqual(bytes);
+  });
+
+  it('skips hash-aware knownLocalBlobs entries whose item localPath differs', async () => {
+    const bytes = new Uint8Array([1, 4, 9]);
+    const hash = sha256hex(bytes);
+    const runtime = createRuntimeStateStore();
+
+    await runtime.store.save('ws://server.test::vault-d', {
+      vaultId: 'ws://server.test::vault-d',
+      pendingRemoteDownloads: [],
+      pendingRemoteDeletes: [],
+      pendingLocalUpserts: [],
+      pendingLocalDeletions: [],
+      knownLocalPaths: [],
+      knownLocalBlobs: [{
+        docPath: 'photo.png',
+        hash,
+        lastSeenAt: new Date().toISOString(),
+        localPath: 'OldDir',
+      }],
+      localPath: 'SharedDir',
+      updatedAt: new Date().toISOString(),
+    });
+
+    const vault = new MockVault();
+    const ydoc = new Y.Doc();
+    (ydoc.getMap('pathToBlob') as Y.Map<{ hash: string; size: number; updatedAt: string }>).set('photo.png', {
+      hash,
+      size: bytes.byteLength,
+      updatedAt: new Date().toISOString(),
+    });
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.endsWith(`/blobs/${hash}`)) return binaryResponse(bytes);
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const sync = new BlobSync(
+      'ws://server.test',
+      'vault-d',
+      'token-d',
+      vault as never,
+      ydoc,
+      (docPath) => `SharedDir/${docPath}`,
+      (vaultPath) => vaultPath.slice('SharedDir/'.length),
+      (vaultPath) => vaultPath.startsWith('SharedDir/'),
+      runtime.store,
+      'ws://server.test::vault-d',
+      'SharedDir',
+    );
+
+    await sync.restoreRuntimeState();
+    await sync.reconcile('authoritative');
+
+    expect((ydoc.getMap('blobTombstones') as Y.Map<unknown>).has('photo.png')).toBe(false);
+    expect(vault.getFileByPath('SharedDir/photo.png')).not.toBeNull();
+  });
+
+  it('drops pendingMissingBlobs entries whose item localPath differs', async () => {
+    const hash = sha256hex(new Uint8Array([2, 4, 8]));
+    const runtime = createRuntimeStateStore();
+
+    await runtime.store.save('ws://server.test::vault-e', {
+      vaultId: 'ws://server.test::vault-e',
+      pendingRemoteDownloads: [],
+      pendingRemoteDeletes: [],
+      pendingLocalUpserts: [],
+      pendingLocalDeletions: [],
+      knownLocalPaths: [],
+      pendingMissingBlobs: [{
+        docPath: 'candidate.png',
+        remoteHashAtCreation: hash,
+        firstSeenAt: new Date().toISOString(),
+        reason: 'weak-evidence',
+        localPath: 'OldDir',
+      }],
+      localPath: 'SharedDir',
+      updatedAt: new Date().toISOString(),
+    });
+
+    const vault = new MockVault();
+    const ydoc = new Y.Doc();
+    (ydoc.getMap('pathToBlob') as Y.Map<{ hash: string; size: number; updatedAt: string }>).set('candidate.png', {
+      hash,
+      size: 3,
+      updatedAt: new Date().toISOString(),
+    });
+
+    const sync = new BlobSync(
+      'ws://server.test',
+      'vault-e',
+      'token-e',
+      vault as never,
+      ydoc,
+      (docPath) => `SharedDir/${docPath}`,
+      (vaultPath) => vaultPath.slice('SharedDir/'.length),
+      (vaultPath) => vaultPath.startsWith('SharedDir/'),
+      runtime.store,
+      'ws://server.test::vault-e',
+      'SharedDir',
+    );
+
+    await sync.restoreRuntimeState();
+    await sync.flushPersistChain();
+
+    expect(runtime.snapshot()).toBeNull();
   });
 
 });

@@ -27,6 +27,17 @@ export interface PendingBlobItem {
   contentType?: string;
 }
 
+type KnownLocalBlob = NonNullable<BlobRuntimeState['knownLocalBlobs']>[number];
+type PendingMissingBlob = NonNullable<BlobRuntimeState['pendingMissingBlobs']>[number];
+type MissingBlobDecision =
+  | { kind: 'confirm-delete'; hash: string; source: 'pending-local-delete' | 'hash-cache' | 'known-local-blob' }
+  | { kind: 'candidate'; reason: PendingMissingBlob['reason'] }
+  | { kind: 'download'; reason: 'no-evidence' | 'weak-path-only' | 'hash-mismatch' | 'candidate-expired' };
+
+const DEFAULT_MISSING_BLOB_CANDIDATE_TTL_MS = 5 * 60 * 1000;
+const DEFAULT_KNOWN_LOCAL_BLOB_TTL_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_PENDING_LOCAL_DELETION_TTL_MS = 24 * 60 * 60 * 1000;
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 function sha256hex(bytes: Uint8Array): string {
@@ -59,6 +70,16 @@ function isRequestFailedStatus(error: unknown, status: number): boolean {
   return error instanceof Error && error.message.includes(`status ${status}`);
 }
 
+function redactBlobPath(path: string): string {
+  const parts = path.split('/');
+  const name = parts.at(-1) ?? path;
+  return parts.length > 1 ? `.../${name}` : name;
+}
+
+function redactBlobHash(hash: string): string {
+  return hash.length > 12 ? `${hash.slice(0, 12)}...` : hash;
+}
+
 // ── BlobSync ──────────────────────────────────────────────────────────────────
 
 /**
@@ -83,6 +104,9 @@ export class BlobSync {
    * "曾经在本地、但在插件未运行期间被删除"的 blob。
    */
   private readonly knownLocalPaths = new Set<string>();
+  private readonly knownLocalBlobs = new Map<string, KnownLocalBlob>();
+  private readonly pendingMissingBlobs = new Map<string, PendingMissingBlob>();
+  private readonly sessionId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
   private readonly pathQueues = new Map<string, Promise<void>>();
   private readonly pendingRemoteDownloads = new Map<string, BlobRef>();
   private pendingDownloadsHandlers: Array<() => void> = [];
@@ -92,6 +116,8 @@ export class BlobSync {
   private readonly pendingRemoteDeletes = new Set<string>();
   private readonly pendingLocalUpserts = new Set<string>();
   private readonly pendingLocalDeletions = new Map<string, string | null>();
+  private readonly pendingLocalDeletionFirstSeenAt = new Map<string, string>();
+  private readonly candidateExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private gateState: BlobApplyGateState = 'startup-blocked';
   private runtimeStateRestored = false;
   private persistChain: Promise<void> = Promise.resolve();
@@ -150,14 +176,16 @@ export class BlobSync {
    */
   async handleLocalBlobDeletion(path: string): Promise<void> {
     if (this.isIgnoredDocPath(path)) return;
-    const ref = this.pathToBlob.get(path);
     const cachedHash = this.hashCache.peek(path);
-    const knownHash = ref?.hash ?? cachedHash ?? null;
-    this.hashCache.delete(path);
-    this.knownLocalPaths.delete(path);
+    const baselineHash = this.knownLocalBlobs.get(path)?.hash ?? null;
+    const knownHash = cachedHash ?? baselineHash;
+    this.forgetLocalBlobEvidence(path);
 
     // 无论 ref 是否在 shared model，都先登记 pending，确保启动窗口期的 delete 不丢。
     this.pendingLocalDeletions.set(path, knownHash);
+    if (knownHash != null && !this.pathToBlob.has(path)) {
+      this.pendingLocalDeletionFirstSeenAt.set(path, new Date().toISOString());
+    }
     this.notifyPendingLocalDeletionsChange();
     this.persistRuntimeState();
 
@@ -402,6 +430,7 @@ export class BlobSync {
         // 远端已经有 tombstone → 同路径 LWW 已生效，跳过。
         if (this.blobTombstones.has(item.docPath)) continue;
         this.pendingLocalDeletions.set(item.docPath, item.hash);
+        this.pendingLocalDeletionFirstSeenAt.set(item.docPath, item.firstSeenAt ?? new Date().toISOString());
       }
     }
     this.notifyPendingLocalDeletionsChange();
@@ -409,6 +438,22 @@ export class BlobSync {
     // 若 localPath 与上次保存时不同（挂载路径已切换），上次记录的 knownLocalPaths
     // 是针对旧路径的，不能用于新路径的"缺失即删除"判断，直接跳过。
     if (localPathMatches) {
+      for (const item of restored.knownLocalBlobs ?? []) {
+        if (this.isIgnoredDocPath(item.docPath)) continue;
+        if (this.blobTombstones.has(item.docPath)) continue;
+        if (!this.persistedLocalPathMatches(item.localPath)) continue;
+        this.knownLocalBlobs.set(item.docPath, item);
+      }
+      for (const item of restored.pendingMissingBlobs ?? []) {
+        if (this.isIgnoredDocPath(item.docPath)) continue;
+        if (this.blobTombstones.has(item.docPath)) continue;
+        if (!this.persistedLocalPathMatches(item.localPath)) continue;
+        const ref = this.pathToBlob.get(item.docPath);
+        if (!ref || ref.hash !== item.remoteHashAtCreation) continue;
+        if (this.vault.getAbstractFileByPath(this.toVaultPath(item.docPath))) continue;
+        this.pendingMissingBlobs.set(item.docPath, item);
+        this.scheduleMissingBlobCandidateExpiry(item);
+      }
       for (const path of restored.knownLocalPaths ?? []) {
         if (this.isIgnoredDocPath(path)) continue;
         if (this.knownLocalPaths.has(path)) continue;
@@ -426,6 +471,243 @@ export class BlobSync {
 
   private isIgnoredDocPath(docPath: string): boolean {
     return this.isIgnoredPath(docPath) || isPathIgnoredBySync(docPath) || isPathIgnoredBySync(this.toVaultPath(docPath));
+  }
+
+  private rememberLocalBlob(docPath: string, hash: BlobHash, file?: TFile, size?: number): void {
+    this.knownLocalPaths.add(docPath);
+    this.knownLocalBlobs.set(docPath, {
+      docPath,
+      hash,
+      lastSeenAt: new Date().toISOString(),
+      localPath: this.localPath,
+      sessionId: this.sessionId,
+      deviceId: this.deviceId,
+      size: size ?? file?.stat.size,
+      mtime: file?.stat.mtime,
+    });
+    if (this.pendingMissingBlobs.delete(docPath)) {
+      this.clearMissingBlobCandidateTimer(docPath);
+    }
+  }
+
+  private forgetLocalBlobEvidence(docPath: string): void {
+    this.hashCache.delete(docPath);
+    this.knownLocalPaths.delete(docPath);
+    this.knownLocalBlobs.delete(docPath);
+    if (this.pendingMissingBlobs.delete(docPath)) {
+      this.clearMissingBlobCandidateTimer(docPath);
+    }
+    this.clearMissingBlobCandidateTimer(docPath);
+  }
+
+  private deletePendingLocalDeletion(docPath: string): boolean {
+    const removed = this.pendingLocalDeletions.delete(docPath);
+    this.pendingLocalDeletionFirstSeenAt.delete(docPath);
+    return removed;
+  }
+
+  private persistedLocalPathMatches(itemLocalPath: string | undefined): boolean {
+    return itemLocalPath === undefined ? this.localPath === undefined : itemLocalPath === this.localPath;
+  }
+
+  private candidateExpired(candidate: PendingMissingBlob, now = Date.now()): boolean {
+    const firstSeenAt = Date.parse(candidate.firstSeenAt);
+    if (!Number.isFinite(firstSeenAt)) return true;
+    return now - firstSeenAt >= DEFAULT_MISSING_BLOB_CANDIDATE_TTL_MS;
+  }
+
+  private knownLocalBlobExpired(item: KnownLocalBlob, now = Date.now()): boolean {
+    const lastSeenAt = Date.parse(item.lastSeenAt);
+    if (!Number.isFinite(lastSeenAt)) return true;
+    return now - lastSeenAt >= DEFAULT_KNOWN_LOCAL_BLOB_TTL_MS;
+  }
+
+  private pendingLocalDeletionExpired(docPath: string, now = Date.now()): boolean {
+    const firstSeenAt = Date.parse(this.pendingLocalDeletionFirstSeenAt.get(docPath) ?? '');
+    if (!Number.isFinite(firstSeenAt)) return false;
+    return now - firstSeenAt >= DEFAULT_PENDING_LOCAL_DELETION_TTL_MS;
+  }
+
+  private classifyMissingRemoteBlob(docPath: string, ref: BlobRef, mode: 'authoritative' | 'conservative'): MissingBlobDecision {
+    if (mode !== 'authoritative') {
+      const candidate = this.pendingMissingBlobs.get(docPath);
+      if (candidate?.remoteHashAtCreation === ref.hash && this.candidateExpired(candidate)) {
+        return { kind: 'download', reason: 'candidate-expired' };
+      }
+      if (this.pendingLocalDeletions.has(docPath) || this.hashCache.peek(docPath) != null || this.knownLocalBlobs.has(docPath)) {
+        return { kind: 'candidate', reason: 'weak-evidence' };
+      }
+      return this.knownLocalPaths.has(docPath)
+        ? { kind: 'download', reason: 'weak-path-only' }
+        : { kind: 'download', reason: 'no-evidence' };
+    }
+
+    const pendingHash = this.pendingLocalDeletions.get(docPath);
+    if (pendingHash != null) {
+      return pendingHash === ref.hash
+        ? { kind: 'confirm-delete', hash: pendingHash, source: 'pending-local-delete' }
+        : { kind: 'download', reason: 'hash-mismatch' };
+    }
+    if (this.pendingLocalDeletions.has(docPath)) {
+      const candidate = this.pendingMissingBlobs.get(docPath);
+      if (candidate?.remoteHashAtCreation === ref.hash) {
+        return this.candidateExpired(candidate)
+          ? { kind: 'download', reason: 'candidate-expired' }
+          : { kind: 'candidate', reason: candidate.reason };
+      }
+      return { kind: 'candidate', reason: 'pending-null-hash' };
+    }
+
+    const cachedHash = this.hashCache.peek(docPath);
+    if (cachedHash != null) {
+      return cachedHash === ref.hash
+        ? { kind: 'confirm-delete', hash: cachedHash, source: 'hash-cache' }
+        : { kind: 'download', reason: 'hash-mismatch' };
+    }
+
+    const baseline = this.knownLocalBlobs.get(docPath);
+    if (baseline) {
+      if (this.knownLocalBlobExpired(baseline)) {
+        return baseline.hash === ref.hash
+          ? { kind: 'candidate', reason: 'stale-baseline' }
+          : { kind: 'download', reason: 'hash-mismatch' };
+      }
+      return baseline.hash === ref.hash
+        ? { kind: 'confirm-delete', hash: baseline.hash, source: 'known-local-blob' }
+        : { kind: 'download', reason: 'hash-mismatch' };
+    }
+
+    if (this.knownLocalPaths.has(docPath)) {
+      return { kind: 'download', reason: 'weak-path-only' };
+    }
+    return { kind: 'download', reason: 'no-evidence' };
+  }
+
+  private trackMissingBlobCandidate(docPath: string, ref: BlobRef, reason: PendingMissingBlob['reason']): void {
+    const existing = this.pendingMissingBlobs.get(docPath);
+    if (existing?.remoteHashAtCreation === ref.hash && existing.reason === reason) return;
+    this.pendingMissingBlobs.set(docPath, {
+      docPath,
+      remoteHashAtCreation: ref.hash,
+      firstSeenAt: new Date().toISOString(),
+      reason,
+      localPath: this.localPath,
+    });
+    this.scheduleMissingBlobCandidateExpiry(this.pendingMissingBlobs.get(docPath)!);
+    console.info(`[BlobSync] quarantined missing blob candidate path=${redactBlobPath(docPath)} hash=${redactBlobHash(ref.hash)} reason=${reason}`);
+    this.persistRuntimeState();
+  }
+
+  private clearMissingBlobCandidate(docPath: string, reason: string): void {
+    if (!this.pendingMissingBlobs.delete(docPath)) return;
+    this.clearMissingBlobCandidateTimer(docPath);
+    console.info(`[BlobSync] cleared missing blob candidate path=${redactBlobPath(docPath)} reason=${reason}`);
+    this.persistRuntimeState();
+  }
+
+  private clearMissingBlobCandidateTimer(docPath: string): void {
+    const timer = this.candidateExpiryTimers.get(docPath);
+    if (!timer) return;
+    clearTimeout(timer);
+    this.candidateExpiryTimers.delete(docPath);
+  }
+
+  private scheduleMissingBlobCandidateExpiry(candidate: PendingMissingBlob): void {
+    this.clearMissingBlobCandidateTimer(candidate.docPath);
+    const firstSeenAt = Date.parse(candidate.firstSeenAt);
+    const elapsed = Number.isFinite(firstSeenAt) ? Date.now() - firstSeenAt : DEFAULT_MISSING_BLOB_CANDIDATE_TTL_MS;
+    const delay = Math.max(0, DEFAULT_MISSING_BLOB_CANDIDATE_TTL_MS - elapsed);
+    const timer = setTimeout(() => {
+      this.candidateExpiryTimers.delete(candidate.docPath);
+      void this.resolveExpiredMissingBlobCandidate(candidate.docPath);
+    }, delay);
+    (timer as { unref?: () => void }).unref?.();
+    this.candidateExpiryTimers.set(candidate.docPath, timer);
+  }
+
+  private async resolveExpiredMissingBlobCandidate(docPath: string): Promise<void> {
+    const candidate = this.pendingMissingBlobs.get(docPath);
+    if (!candidate) return;
+    if (!this.candidateExpired(candidate)) {
+      this.scheduleMissingBlobCandidateExpiry(candidate);
+      return;
+    }
+    const ref = this.pathToBlob.get(docPath);
+    if (!ref || ref.hash !== candidate.remoteHashAtCreation || this.blobTombstones.has(docPath)) {
+      this.clearMissingBlobCandidate(docPath, 'candidate-invalidated');
+      return;
+    }
+    if (this.vault.getAbstractFileByPath(this.toVaultPath(docPath))) {
+      this.clearMissingBlobCandidate(docPath, 'local-reappeared');
+      return;
+    }
+    let downloaded = false;
+    let pendingDownloadRemoved = false;
+    try {
+      await this.enqueuePathOperation(docPath, async () => {
+        const currentRef = this.pathToBlob.get(docPath);
+        if (!currentRef || currentRef.hash !== ref.hash || this.blobTombstones.has(docPath)) {
+          if (this.deletePendingLocalDeletion(docPath)) {
+            this.notifyPendingLocalDeletionsChange();
+          }
+          this.clearMissingBlobCandidate(docPath, 'candidate-invalidated');
+          return;
+        }
+        if (this.vault.getAbstractFileByPath(this.toVaultPath(docPath))) {
+          if (this.deletePendingLocalDeletion(docPath)) {
+            this.notifyPendingLocalDeletionsChange();
+          }
+          this.clearMissingBlobCandidate(docPath, 'local-reappeared');
+          return;
+        }
+        if (this.pendingRemoteDownloads.get(docPath)?.hash === currentRef.hash) {
+          this.pendingRemoteDownloads.delete(docPath);
+          this.notifyPendingDownloadsChange();
+          pendingDownloadRemoved = true;
+        }
+        await this.downloadIfMissing(docPath, currentRef);
+        downloaded = true;
+      });
+    } catch (err) {
+      if (pendingDownloadRemoved && this.pathToBlob.get(docPath)?.hash === ref.hash && !this.blobTombstones.has(docPath)) {
+        this.pendingRemoteDownloads.set(docPath, ref);
+        this.notifyPendingDownloadsChange();
+      }
+      console.error('[BlobSync] expired missing blob candidate download failed:', err);
+      this.persistRuntimeState();
+      await this.flushPersistChain();
+      return;
+    }
+    if (downloaded && this.deletePendingLocalDeletion(docPath)) {
+      this.notifyPendingLocalDeletionsChange();
+    }
+    if (downloaded) {
+      this.clearMissingBlobCandidate(docPath, 'candidate-expired');
+    }
+    this.persistRuntimeState();
+    await this.flushPersistChain();
+  }
+
+  private writeLocalBlobTombstone(docPath: string, hash: string): void {
+    const ref = this.pathToBlob.get(docPath);
+    if (!ref || ref.hash !== hash) return;
+    this.ydoc.transact(() => {
+      this.pathToBlob.delete(docPath);
+      this.blobTombstones.set(docPath, {
+        hash,
+        deletedAt: new Date().toISOString(),
+        deviceId: this.deviceId,
+        deviceName: this.deviceName,
+        vaultId: this.vaultId,
+        deleteSource: 'local-delete',
+      });
+    }, 'local-blob');
+    this.deletePendingLocalDeletion(docPath);
+    this.knownLocalPaths.delete(docPath);
+    this.knownLocalBlobs.delete(docPath);
+    if (this.pendingMissingBlobs.delete(docPath)) {
+      this.clearMissingBlobCandidateTimer(docPath);
+    }
   }
 
   private async uploadIfNeeded(
@@ -499,18 +781,15 @@ export class BlobSync {
     const file = this.vault.getFileByPath(vaultPath);
     if (file) {
       this.hashCache.set(docPath, file.stat.mtime, file.stat.size, ref.hash);
-      if (!this.knownLocalPaths.has(docPath)) {
-        this.knownLocalPaths.add(docPath);
-        this.persistRuntimeState();
-      }
+      this.rememberLocalBlob(docPath, ref.hash, file, ref.size);
+      this.persistRuntimeState();
     }
   }
 
   private async deleteLocalFile(docPath: string): Promise<void> {
     const file = this.vault.getAbstractFileByPath(this.toVaultPath(docPath));
     if (!file || !('stat' in file)) return;
-    this.hashCache.delete(docPath);
-    this.knownLocalPaths.delete(docPath);
+    this.forgetLocalBlobEvidence(docPath);
     await this.vault.delete(file);
   }
 
@@ -565,10 +844,6 @@ export class BlobSync {
     for (const file of localFiles) {
       const docPath = this.toDocPath(file.path);
       localSet.add(docPath);
-      if (!this.knownLocalPaths.has(docPath)) {
-        this.knownLocalPaths.add(docPath);
-        knownLocalPathsChanged = true;
-      }
 
       const ref = this.pathToBlob.get(docPath);
       if (!ref) {
@@ -579,7 +854,9 @@ export class BlobSync {
       }
 
       const localHash = await this.getLocalBlobHash(docPath, file);
-      this.knownLocalPaths.add(docPath);
+      const before = this.knownLocalBlobs.get(docPath);
+      this.rememberLocalBlob(docPath, localHash, file, file.stat.size);
+      if (before?.hash !== localHash || !this.knownLocalPaths.has(docPath)) knownLocalPathsChanged = true;
       if (this.blobTombstones.has(docPath) && mode === 'authoritative') {
         if (this.pendingRemoteDeletes.has(docPath)) continue;
         await this.handleLocalBlobChange(docPath);
@@ -598,13 +875,22 @@ export class BlobSync {
       if (this.blobTombstones.has(docPath)) continue;
       // 仍在 pending 中（例如 hash 未知、flushPendingLocalDeletions 保留）的删除意图
       // 同样不能下载；等 hash 线索到齐后由后续 flush 转成 tombstone。
-      if (this.pendingLocalDeletions.has(docPath)) continue;
-      if (this.isMissingLocalBlob(docPath)) {
-        if (mode === 'authoritative') {
-          await this.handleLocalBlobDeletion(docPath);
-        }
+      const decision = this.classifyMissingRemoteBlob(docPath, ref, mode);
+      if (decision.kind === 'confirm-delete') {
+        this.writeLocalBlobTombstone(docPath, decision.hash);
+        this.notifyPendingLocalDeletionsChange();
+        this.persistRuntimeState();
         continue;
       }
+      if (decision.kind === 'candidate') {
+        this.trackMissingBlobCandidate(docPath, ref, decision.reason);
+        continue;
+      }
+      if (this.deletePendingLocalDeletion(docPath)) {
+        this.notifyPendingLocalDeletionsChange();
+        this.persistRuntimeState();
+      }
+      this.clearMissingBlobCandidate(docPath, decision.reason);
       await this.downloadIfMissing(docPath, ref);
     }
 
@@ -612,15 +898,6 @@ export class BlobSync {
       this.persistRuntimeState();
     }
     this.discardUnresolvableLocalDeletions();
-  }
-
-  private isMissingLocalBlob(docPath: string): boolean {
-    // hashCache.has: file was seen in the current session (and since deleted).
-    // knownLocalPaths.has: file was confirmed present in a previous session.
-    // blobTombstones check is redundant here (outer loop already guards it),
-    // but kept for safety against direct calls.
-    return (this.hashCache.has(docPath) || this.knownLocalPaths.has(docPath))
-      && !this.blobTombstones.has(docPath);
   }
 
   private async flushPendingRemoteChanges(): Promise<void> {
@@ -656,6 +933,26 @@ export class BlobSync {
         const currentRef = this.pathToBlob.get(docPath);
         if (!currentRef || currentRef.hash !== ref.hash) return;
         if (this.blobTombstones.has(docPath)) return;
+        if (!this.vault.getAbstractFileByPath(this.toVaultPath(docPath))) {
+          const decision = this.classifyMissingRemoteBlob(docPath, currentRef, 'authoritative');
+          if (decision.kind === 'confirm-delete') {
+            this.writeLocalBlobTombstone(docPath, decision.hash);
+            this.notifyPendingLocalDeletionsChange();
+            this.persistRuntimeState();
+            return;
+          }
+          if (decision.kind === 'candidate') {
+            this.trackMissingBlobCandidate(docPath, currentRef, decision.reason);
+            this.pendingRemoteDownloads.set(docPath, currentRef);
+            this.notifyPendingDownloadsChange();
+            return;
+          }
+          if (this.deletePendingLocalDeletion(docPath)) {
+            this.notifyPendingLocalDeletionsChange();
+            this.persistRuntimeState();
+          }
+          this.clearMissingBlobCandidate(docPath, decision.reason);
+        }
         await this.downloadIfMissing(docPath, ref);
       }).catch((err) => errors.push(err));
     }
@@ -683,45 +980,60 @@ export class BlobSync {
   private flushPendingLocalDeletions(): void {
     if (this.pendingLocalDeletions.size === 0) return;
     let mutated = false;
+    const candidates: Array<{ docPath: string; ref: BlobRef; reason: PendingMissingBlob['reason'] }> = [];
     this.ydoc.transact(() => {
       for (const [docPath, knownHash] of [...this.pendingLocalDeletions]) {
         if (this.isIgnoredDocPath(docPath)) {
-          this.pendingLocalDeletions.delete(docPath);
+          this.deletePendingLocalDeletion(docPath);
           mutated = true;
           continue;
         }
         // 本地文件又出现了 → 用户可能撤销删除，让随后的 upsert/rescan 处理。
         if (this.vault.getAbstractFileByPath(this.toVaultPath(docPath))) {
-          this.pendingLocalDeletions.delete(docPath);
+          this.deletePendingLocalDeletion(docPath);
           mutated = true;
           continue;
         }
         if (this.blobTombstones.has(docPath)) {
           // 远端已墓碑，幂等移出 pending。
-          this.pendingLocalDeletions.delete(docPath);
+          this.deletePendingLocalDeletion(docPath);
           mutated = true;
           continue;
         }
         const ref = this.pathToBlob.get(docPath);
-        const hash = ref?.hash ?? knownHash;
-        if (!hash) {
-          // 没有任何 hash 线索 → 保留在 pending，等 pathToBlob 或 hashCache 到齐后再 flush。
+        if (!ref) {
+          // 没有 current remote ref 时不能新建 tombstone，保留证据等待匹配 ref 或后续安全过期。
           continue;
         }
-        if (ref) this.pathToBlob.delete(docPath);
+        if (knownHash == null) {
+          candidates.push({ docPath, ref, reason: 'pending-null-hash' });
+          continue;
+        }
+        if (knownHash !== ref.hash) {
+          this.deletePendingLocalDeletion(docPath);
+          this.pendingMissingBlobs.delete(docPath);
+          mutated = true;
+          continue;
+        }
+        this.pathToBlob.delete(docPath);
         this.blobTombstones.set(docPath, {
-          hash,
+          hash: knownHash,
           deletedAt: new Date().toISOString(),
           deviceId: this.deviceId,
           deviceName: this.deviceName,
           vaultId: this.vaultId,
           deleteSource: 'local-delete',
         });
-        this.pendingLocalDeletions.delete(docPath);
+        this.deletePendingLocalDeletion(docPath);
         this.knownLocalPaths.delete(docPath);
+        this.knownLocalBlobs.delete(docPath);
+        this.pendingMissingBlobs.delete(docPath);
         mutated = true;
       }
     }, 'local-blob');
+    for (const { docPath, ref, reason } of candidates) {
+      this.trackMissingBlobCandidate(docPath, ref, reason);
+    }
     if (mutated) {
       this.notifyPendingLocalDeletionsChange();
       this.persistRuntimeState();
@@ -731,11 +1043,11 @@ export class BlobSync {
   private discardUnresolvableLocalDeletions(): void {
     let changed = false;
     for (const [docPath, knownHash] of [...this.pendingLocalDeletions]) {
-      if (knownHash) continue;
       if (this.pathToBlob.has(docPath)) continue;
       if (this.blobTombstones.has(docPath)) continue;
       if (this.vault.getAbstractFileByPath(this.toVaultPath(docPath))) continue;
-      this.pendingLocalDeletions.delete(docPath);
+      if (knownHash && !this.pendingLocalDeletionExpired(docPath)) continue;
+      this.deletePendingLocalDeletion(docPath);
       this.knownLocalPaths.delete(docPath);
       changed = true;
     }
@@ -789,6 +1101,8 @@ export class BlobSync {
 
       const existingRef = this.pathToBlob.get(path);
       if (existingRef?.hash === hash) {
+        const file = this.vault.getFileByPath(this.toVaultPath(path)) ?? undefined;
+        this.rememberLocalBlob(path, hash, file, size);
         if (this.blobTombstones.has(path)) {
           if (this.pendingRemoteDeletes.has(path)) {
             completed = true;
@@ -827,7 +1141,8 @@ export class BlobSync {
           this.blobTombstones.delete(path);
         }
       }, 'local-blob');
-      this.knownLocalPaths.add(path);
+      const file = this.vault.getFileByPath(this.toVaultPath(path)) ?? undefined;
+      this.rememberLocalBlob(path, hash, file, size);
       completed = true;
     } finally {
       if (completed) {
@@ -841,7 +1156,7 @@ export class BlobSync {
   private processLocalBlobDeletion(path: string): Promise<void> {
     // 文件又出现了 → 放弃这条 deletion，交给后续的 upsert/rescan 处理。
     if (this.vault.getAbstractFileByPath(this.toVaultPath(path))) {
-      if (this.pendingLocalDeletions.delete(path)) {
+      if (this.deletePendingLocalDeletion(path)) {
         this.notifyPendingLocalDeletionsChange();
         this.persistRuntimeState();
       }
@@ -850,7 +1165,7 @@ export class BlobSync {
 
     // 已有 tombstone（LWW 已生效或被并发写入）→ 幂等退出。
     if (this.blobTombstones.has(path)) {
-      if (this.pendingLocalDeletions.delete(path)) {
+      if (this.deletePendingLocalDeletion(path)) {
         this.notifyPendingLocalDeletionsChange();
         this.persistRuntimeState();
       }
@@ -859,16 +1174,26 @@ export class BlobSync {
 
     const ref = this.pathToBlob.get(path);
     const pendingHash = this.pendingLocalDeletions.get(path) ?? null;
-    const hash = ref?.hash ?? pendingHash;
-    if (!hash) {
-      // 没有任何 hash 线索 → 保留在 pending，等 flushPendingLocalDeletions 处理。
+    if (!ref) {
+      // 没有 current remote ref 时不能新建 tombstone，保留 pending 供后续匹配 ref 或安全过期。
+      return Promise.resolve();
+    }
+    if (pendingHash == null) {
+      this.trackMissingBlobCandidate(path, ref, 'pending-null-hash');
+      return Promise.resolve();
+    }
+    if (pendingHash !== ref.hash) {
+      this.deletePendingLocalDeletion(path);
+      this.notifyPendingLocalDeletionsChange();
+      this.clearMissingBlobCandidate(path, 'remote-hash-mismatch');
+      this.persistRuntimeState();
       return Promise.resolve();
     }
 
     this.ydoc.transact(() => {
-      if (ref) this.pathToBlob.delete(path);
+      this.pathToBlob.delete(path);
       this.blobTombstones.set(path, {
-        hash,
+        hash: pendingHash,
         deletedAt: new Date().toISOString(),
         deviceId: this.deviceId,
         deviceName: this.deviceName,
@@ -876,9 +1201,11 @@ export class BlobSync {
         deleteSource: 'local-delete',
       });
     }, 'local-blob');
-    this.pendingLocalDeletions.delete(path);
+    this.deletePendingLocalDeletion(path);
     this.notifyPendingLocalDeletionsChange();
     this.knownLocalPaths.delete(path);
+    this.knownLocalBlobs.delete(path);
+    this.pendingMissingBlobs.delete(path);
     this.persistRuntimeState();
     return Promise.resolve();
   }
@@ -916,17 +1243,21 @@ export class BlobSync {
     const pendingLocalUpserts = [...this.pendingLocalUpserts].filter((docPath) => !this.isIgnoredDocPath(docPath));
     const pendingLocalDeletions = [...this.pendingLocalDeletions]
       .filter(([docPath]) => !this.isIgnoredDocPath(docPath))
-      .map(([docPath, hash]) => ({
-        docPath,
-        hash,
-      }));
+      .map(([docPath, hash]) => {
+        const firstSeenAt = this.pendingLocalDeletionFirstSeenAt.get(docPath);
+        return firstSeenAt ? { docPath, hash, firstSeenAt } : { docPath, hash };
+      });
     const knownLocalPaths = [...this.knownLocalPaths].filter((docPath) => !this.isIgnoredDocPath(docPath));
+    const knownLocalBlobs = [...this.knownLocalBlobs.values()].filter((item) => !this.isIgnoredDocPath(item.docPath));
+    const pendingMissingBlobs = [...this.pendingMissingBlobs.values()].filter((item) => !this.isIgnoredDocPath(item.docPath));
 
     if (
       pendingRemoteDownloads.length === 0 &&
       pendingRemoteDeletes.length === 0 &&
       pendingLocalUpserts.length === 0 &&
       pendingLocalDeletions.length === 0 &&
+      knownLocalBlobs.length === 0 &&
+      pendingMissingBlobs.length === 0 &&
       knownLocalPaths.length === 0
     ) {
       return null;
@@ -937,6 +1268,8 @@ export class BlobSync {
       pendingRemoteDeletes,
       pendingLocalUpserts,
       pendingLocalDeletions,
+      knownLocalBlobs,
+      pendingMissingBlobs,
       knownLocalPaths,
       localPath: this.localPath,
       updatedAt: new Date().toISOString(),

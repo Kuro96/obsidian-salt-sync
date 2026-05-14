@@ -32,11 +32,32 @@ export interface BlobRuntimeState {
   pendingRemoteDeletes: string[];
   pendingLocalUpserts: string[];
   /** 启动窗口期或 pathToBlob 尚未同步时观测到的本地删除。hash 为 null 表示当时未知。 */
-  pendingLocalDeletions?: Array<{ docPath: string; hash: string | null }>;
+  pendingLocalDeletions?: Array<{ docPath: string; hash: string | null; firstSeenAt?: string }>;
+  /** Hash-aware local blob baseline. A record is strong evidence only when hash matches the current remote ref. */
+  knownLocalBlobs?: Array<{
+    docPath: string;
+    hash: string;
+    lastSeenAt: string;
+    localPath?: string;
+    sessionId?: string;
+    deviceId?: string;
+    size?: number;
+    mtime?: number;
+  }>;
+  /** Ambiguous local absence waiting for a deterministic TTL fallback. */
+  pendingMissingBlobs?: Array<{
+    docPath: string;
+    remoteHashAtCreation: string;
+    firstSeenAt: string;
+    reason: 'pending-null-hash' | 'stale-baseline' | 'weak-evidence';
+    localPath?: string;
+  }>;
   /**
    * 已确认在本设备本地存在过的 blob 路径集合（跨会话持久化）。
    * 用于在 hashCache 被清空后（如重启）仍能识别出本地删除，
    * 避免把"本地已删除但 hashCache 空"的文件错误地重新下载。
+   *
+   * Compatibility only: path-only entries are weak evidence and must not confirm tombstones.
    */
   knownLocalPaths?: string[];
   /**
