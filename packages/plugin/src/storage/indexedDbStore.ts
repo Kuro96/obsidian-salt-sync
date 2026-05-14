@@ -20,6 +20,8 @@ export interface PluginCacheVersionMarker {
 export interface MarkdownPendingState {
   vaultId: VaultId;
   pendingLocalDeletions: string[];
+  /** Markdown paths confirmed to have existed on this device, persisted across restarts. */
+  knownLocalMarkdownPaths?: string[];
   localPath?: string;
   updatedAt: string;
 }

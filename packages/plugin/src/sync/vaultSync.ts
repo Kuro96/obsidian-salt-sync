@@ -99,7 +99,7 @@ export class VaultSyncEngine implements SyncEngine {
   private bridge!: ObsidianFilesystemBridge;
   private blobSync!: BlobSync;
   /**
-   * 本设备在当前会话中确认过存在于本地磁盘的 markdown 路径。
+   * 本设备在当前或历史会话中确认过存在于本地磁盘的 markdown 路径。
    * 只对这些路径做“缺失即 tombstone”的补偿，避免新设备首同步时把
    * 纯远端文件误判成本地删除。
    */
@@ -680,7 +680,7 @@ export class VaultSyncEngine implements SyncEngine {
       const docPath = this.toDocPath(file.path);
       localDocPaths.add(docPath);
       if (this.pendingLocalMarkdownDeletions.has(docPath)) continue;
-      this.knownLocalMarkdownPaths.add(docPath);
+      this.rememberKnownLocalMarkdownPath(docPath);
       this.getOrCreateYText(docPath);
       if (this.fileTombstones.has(docPath)) {
         const decision = this.markdownTombstones.getDecision(docPath);
@@ -719,19 +719,26 @@ export class VaultSyncEngine implements SyncEngine {
       if (this.fileTombstones.has(docPath)) continue;
       if (this.knownLocalMarkdownPaths.has(docPath)) continue; // missing from disk → tombstone loop
       // File exists in Y.Doc but was never seen locally: write it to the new path.
-      this.knownLocalMarkdownPaths.add(docPath);
       localDocPaths.add(docPath);
-      await this.bridge.flushFile(docPath).catch((err) => {
+      try {
+        await this.materializeRemoteMarkdownPath(docPath);
+      } catch (err) {
         console.error(`[VaultSync] reconcile flushFile error for ${docPath}:`, err);
-      });
+      }
     }
-    // Detect paths this session has confirmed locally, then later found absent.
-    // Only those in-session misses are treated as local deletions.
-    for (const docPath of [...this.pathToId.keys()]) {
-      if (this.isIgnoredDocPath(docPath)) continue;
-      if (localDocPaths.has(docPath)) continue;
-      if (this.fileTombstones.has(docPath)) continue;
-      if (!this.knownLocalMarkdownPaths.has(docPath)) continue;
+    const missingKnownMarkdownPaths = [...this.pathToId.keys()].filter((docPath) => {
+      if (this.isIgnoredDocPath(docPath)) return false;
+      if (localDocPaths.has(docPath)) return false;
+      if (this.fileTombstones.has(docPath)) return false;
+      return this.knownLocalMarkdownPaths.has(docPath);
+    });
+    if (this.shouldDeferMissingKnownMarkdownDeletes(files.length, missingKnownMarkdownPaths.length)) {
+      console.warn(`[VaultSync] reconcile deferred ${missingKnownMarkdownPaths.length} missing known markdown paths because the local markdown scan looks incomplete (${this.mount?.localPath ?? 'primary'}; localFiles=${files.length})`);
+      return;
+    }
+    // Detect paths this device has confirmed locally, then later found absent.
+    // Only those known-local misses are treated as local deletions.
+    for (const docPath of missingKnownMarkdownPaths) {
       this.handleLocalFileDeletion(docPath, 'reconcile-missing');
     }
     console.log(`[VaultSync] reconcile — ${files.length} files (${this.mount?.localPath ?? 'primary'})`);
@@ -757,7 +764,7 @@ export class VaultSyncEngine implements SyncEngine {
       await this.acceptRestoredLocalMarkdownPath(docPath);
       return;
     }
-    this.knownLocalMarkdownPaths.add(docPath);
+    this.rememberKnownLocalMarkdownPath(docPath);
     this.getOrCreateYText(docPath);
     this.bridge.markDirty(vaultPath);
   }
@@ -768,8 +775,8 @@ export class VaultSyncEngine implements SyncEngine {
     this.bridge?.updatePathAfterRename(oldVaultPath, newVaultPath);
     const oldDocPath = this.toDocPath(oldVaultPath);
     const newDocPath = this.toDocPath(newVaultPath);
-    if (this.knownLocalMarkdownPaths.delete(oldDocPath)) {
-      this.knownLocalMarkdownPaths.add(newDocPath);
+    if (this.forgetKnownLocalMarkdownPath(oldDocPath)) {
+      this.rememberKnownLocalMarkdownPath(newDocPath);
     }
     const fileId = this.pathToId.get(oldDocPath);
 
@@ -804,7 +811,7 @@ export class VaultSyncEngine implements SyncEngine {
 
   handleLocalFileDeletion(docPath: string, deleteSource = 'local-delete'): void {
     this.editorBindings?.unbindByPath(this.toVaultPath(docPath));
-    this.knownLocalMarkdownPaths.delete(docPath);
+    this.forgetKnownLocalMarkdownPath(docPath);
     const fileId = this.pathToId.get(docPath);
     if (!fileId) {
       if (this.markdownDeleteGateState !== 'open' && !this.fileTombstones.has(docPath)) {
@@ -854,7 +861,7 @@ export class VaultSyncEngine implements SyncEngine {
     if (!this.plugin.app.vault.getAbstractFileByPath(this.toVaultPath(docPath))) return;
     this.bridge.quarantineRemoteFlushes([docPath]);
     try {
-      this.knownLocalMarkdownPaths.add(docPath);
+      this.rememberKnownLocalMarkdownPath(docPath);
       this.getOrCreateYText(docPath);
       await this.bridge.forceImportFromDisk(docPath);
       if (!this.plugin.app.vault.getAbstractFileByPath(this.toVaultPath(docPath))) return;
@@ -869,7 +876,7 @@ export class VaultSyncEngine implements SyncEngine {
 
   private acceptLocalEditorContent(docPath: string): void {
     if (!this.plugin.app.vault.getAbstractFileByPath(this.toVaultPath(docPath))) return;
-    this.knownLocalMarkdownPaths.add(docPath);
+    this.rememberKnownLocalMarkdownPath(docPath);
     this.fileTombstones.delete(docPath);
     if (this.pendingLocalMarkdownDeletions.delete(docPath)) {
       this.scheduleCacheSave();
@@ -890,6 +897,14 @@ export class VaultSyncEngine implements SyncEngine {
         deleteSource,
       });
     }, 'local-delete');
+  }
+
+  private async materializeRemoteMarkdownPath(docPath: string): Promise<void> {
+    await this.bridge.flushFile(docPath);
+    const file = this.plugin.app.vault.getFileByPath(this.toVaultPath(docPath)) as TFile | null;
+    if (file) {
+      this.rememberKnownLocalMarkdownPath(docPath);
+    }
   }
 
   private handleExternalMarkdownDeletion(docPath: string): void {
@@ -1021,11 +1036,7 @@ export class VaultSyncEngine implements SyncEngine {
     }
 
     for (const docPath of removedMarkdownPaths) {
-      this.knownLocalMarkdownPaths.delete(docPath);
-    }
-
-    for (const docPath of restoredMarkdownPaths) {
-      this.knownLocalMarkdownPaths.add(docPath);
+      this.forgetKnownLocalMarkdownPath(docPath);
     }
 
     for (const docPath of removedMarkdownPaths) {
@@ -1035,7 +1046,7 @@ export class VaultSyncEngine implements SyncEngine {
     }
 
     for (const docPath of restoredMarkdownPaths) {
-      await this.bridge.flushFile(docPath).catch((err) => {
+      await this.materializeRemoteMarkdownPath(docPath).catch((err) => {
         console.error(`[VaultSync] restore flushFile error for ${docPath}:`, err);
       });
     }
@@ -1088,6 +1099,7 @@ export class VaultSyncEngine implements SyncEngine {
     await this.markdownPendingStore.save(this.localCacheKey, {
       vaultId: this.localCacheKey,
       pendingLocalDeletions: [...this.pendingLocalMarkdownDeletions].filter((docPath) => !this.isIgnoredDocPath(docPath)),
+      knownLocalMarkdownPaths: [...this.knownLocalMarkdownPaths].filter((docPath) => !this.isIgnoredDocPath(docPath)),
       localPath: this.mount?.localPath,
       updatedAt: new Date().toISOString(),
     });
@@ -1097,6 +1109,11 @@ export class VaultSyncEngine implements SyncEngine {
     const saved = await this.markdownPendingStore.load(this.localCacheKey);
     if (!saved) return;
     if (saved.localPath !== this.mount?.localPath) return;
+
+    for (const docPath of saved.knownLocalMarkdownPaths ?? []) {
+      if (this.isIgnoredDocPath(docPath)) continue;
+      this.knownLocalMarkdownPaths.add(docPath);
+    }
 
     for (const docPath of saved.pendingLocalDeletions) {
       if (this.isIgnoredDocPath(docPath)) continue;
@@ -1216,6 +1233,9 @@ export class VaultSyncEngine implements SyncEngine {
     await this.bridge.deleteFile(docPath, () => this.fileTombstones.has(docPath)).catch((err) => {
       console.error(`[VaultSync] deleteFile error for ${docPath}:`, err);
     });
+    if (this.fileTombstones.has(docPath)) {
+      this.forgetKnownLocalMarkdownPath(docPath);
+    }
   }
 
   private handleRemoteTransactionSideEffects(txn: Y.Transaction): void {
@@ -1261,6 +1281,7 @@ export class VaultSyncEngine implements SyncEngine {
         if (!fileId) {
           // 路径从 pathToId 中移除：只有同一事务能证明它是单目标 rename 的源路径时，才清理本地旧路径。
           if (!this.fileTombstones.has(docPath) && this.getUnambiguousRemoteRenameTarget(docPath, txn)) {
+            this.forgetKnownLocalMarkdownPath(docPath);
             this.editorBindings.unbindByPath(this.toVaultPath(docPath));
             this.bridge.notifyFileClosed(this.toVaultPath(docPath));
             const expectedFile = this.plugin.app.vault.getFileByPath(this.toVaultPath(docPath)) as TFile | null;
@@ -1274,7 +1295,7 @@ export class VaultSyncEngine implements SyncEngine {
           // 路径新增到 pathToId：如果 docs 有对应 Y.Text 且本地无该文件，
           // 说明是 rename 的目标路径，物化到磁盘。
           if (this.docs.get(fileId) && !this.plugin.app.vault.getAbstractFileByPath(this.toVaultPath(docPath))) {
-            this.bridge.flushFile(docPath).catch((err) => {
+            this.materializeRemoteMarkdownPath(docPath).catch((err) => {
               console.error(`[VaultSync] remote rename flush error for ${docPath}:`, err);
             });
           }
@@ -1298,6 +1319,28 @@ export class VaultSyncEngine implements SyncEngine {
 
   private isIgnoredDocPath(docPath: string): boolean {
     return isPathIgnoredBySync(docPath) || this.isIgnoredVaultPath(this.toVaultPath(docPath));
+  }
+
+  private rememberKnownLocalMarkdownPath(docPath: string): void {
+    if (this.isIgnoredDocPath(docPath)) return;
+    if (this.knownLocalMarkdownPaths.has(docPath)) return;
+    this.knownLocalMarkdownPaths.add(docPath);
+    this.scheduleCacheSave();
+  }
+
+  private forgetKnownLocalMarkdownPath(docPath: string): boolean {
+    const changed = this.knownLocalMarkdownPaths.delete(docPath);
+    if (changed) this.scheduleCacheSave();
+    return changed;
+  }
+
+  private shouldDeferMissingKnownMarkdownDeletes(_localMarkdownFileCount: number, missingKnownMarkdownPathCount: number): boolean {
+    return missingKnownMarkdownPathCount > 0 && this.isMountRootMissing();
+  }
+
+  private isMountRootMissing(): boolean {
+    if (!this.mount) return false;
+    return !this.plugin.app.vault.getAbstractFileByPath(normalizeVaultPath(this.mount.localPath));
   }
 
   private bindAllOpenEditors(): void {
