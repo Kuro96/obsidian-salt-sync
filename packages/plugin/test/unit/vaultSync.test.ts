@@ -1114,7 +1114,7 @@ describe('VaultSyncEngine', () => {
       expect(pathToId.get('remote.md')).toBe(fid);
     });
 
-    it('defers tombstones when a partial local scan would delete many known markdown paths', async () => {
+    it('tombstones large legitimate delete batches when some markdown files remain', async () => {
       const engine = setupForReconcile(['survivor.md']);
       const { ydoc, pathToId, idToPath, docs, tombstones, knownLocalMarkdownPaths } = internals(engine);
       ydoc.transact(() => {
@@ -1135,8 +1135,10 @@ describe('VaultSyncEngine', () => {
 
       for (let i = 0; i < 25; i += 1) {
         const docPath = `missing-${i}.md`;
-        expect(tombstones.has(docPath)).toBe(false);
-        expect(pathToId.get(docPath)).toBe(`file-missing-${i}`);
+        expect(knownLocalMarkdownPaths.has(docPath)).toBe(false);
+        expect(tombstones.has(docPath)).toBe(true);
+        expect(tombstones.get(docPath)?.deleteSource).toBe('reconcile-missing');
+        expect(pathToId.has(docPath)).toBe(false);
       }
     });
 

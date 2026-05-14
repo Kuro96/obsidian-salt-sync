@@ -61,7 +61,6 @@ export interface SyncStatus {
 }
 
 type MarkdownDeleteGateState = 'startup-blocked' | 'maintenance-blocked' | 'open';
-const MAX_RECONCILE_MISSING_KNOWN_MARKDOWN_DELETIONS = 20;
 
 // ── Snapshot API response types ───────────────────────────────────────────────
 
@@ -1335,11 +1334,8 @@ export class VaultSyncEngine implements SyncEngine {
     return changed;
   }
 
-  private shouldDeferMissingKnownMarkdownDeletes(localMarkdownFileCount: number, missingKnownMarkdownPathCount: number): boolean {
-    if (missingKnownMarkdownPathCount === 0) return false;
-    if (localMarkdownFileCount === 0) return this.isMountRootMissing();
-    return missingKnownMarkdownPathCount > MAX_RECONCILE_MISSING_KNOWN_MARKDOWN_DELETIONS
-      && missingKnownMarkdownPathCount > localMarkdownFileCount;
+  private shouldDeferMissingKnownMarkdownDeletes(_localMarkdownFileCount: number, missingKnownMarkdownPathCount: number): boolean {
+    return missingKnownMarkdownPathCount > 0 && this.isMountRootMissing();
   }
 
   private isMountRootMissing(): boolean {
