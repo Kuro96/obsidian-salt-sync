@@ -170,7 +170,7 @@ describe('VaultSyncEngine', () => {
       const plugin = new MockPlugin();
       const originalFile = plugin.app.vault.seedText('old.md', 'original local');
       const engine = new VaultSyncEngine(plugin as unknown as Plugin, baseSettings(), null);
-      const { ydoc, pathToId, idToPath, docs } = internals(engine);
+      const { ydoc, pathToId, idToPath, docs, knownLocalMarkdownPaths } = internals(engine);
       const self = engine as unknown as {
         bridge: { deleteFile: Mock; notifyFileClosed: Mock; handleRemoteTransaction: Mock; flushFile: Mock };
         editorBindings: { unbindByPath: Mock };
@@ -180,6 +180,7 @@ describe('VaultSyncEngine', () => {
       self.bridge = { deleteFile: vi.fn(async () => {}), notifyFileClosed: vi.fn(), handleRemoteTransaction: vi.fn(), flushFile: vi.fn(async () => {}) };
       self.editorBindings = { unbindByPath: vi.fn() };
       self.blobSync = { handleRemoteBlobChanges: vi.fn(async () => {}) };
+      knownLocalMarkdownPaths.add('old.md');
 
       let remoteTxn: Y.Transaction | null = null;
       ydoc.transact(() => {
@@ -199,6 +200,7 @@ describe('VaultSyncEngine', () => {
       self.handleRemoteTransactionSideEffects(remoteTxn!);
 
       expect(self.bridge.deleteFile).toHaveBeenCalledWith('old.md', expect.any(Function));
+      expect(knownLocalMarkdownPaths.has('old.md')).toBe(false);
       const shouldDelete = self.bridge.deleteFile.mock.calls[0][1] as (file: TFile | null) => boolean;
       expect(shouldDelete(originalFile)).toBe(true);
       plugin.app.vault.files.delete('old.md');
@@ -220,7 +222,7 @@ describe('VaultSyncEngine', () => {
       const engine = new VaultSyncEngine(fakePlugin(), baseSettings(), null);
       const vault = new MockVault();
       vault.seedText('kept.md', 'local content');
-      const { ydoc, tombstones } = internals(engine);
+      const { ydoc, tombstones, knownLocalMarkdownPaths } = internals(engine);
       const self = engine as unknown as {
         bridge: ObsidianFilesystemBridge;
         blobSync: { handleRemoteBlobChanges: (txn: Y.Transaction) => Promise<void> };
@@ -235,6 +237,7 @@ describe('VaultSyncEngine', () => {
       self.initialSyncComplete = remoteFileDeleteSideEffectsOpen;
       self.remoteFileDeleteSideEffectsOpen = remoteFileDeleteSideEffectsOpen;
       const deleteSpy = vi.spyOn(vault, 'delete');
+      knownLocalMarkdownPaths.add('kept.md');
 
       let remoteTxn: Y.Transaction | null = null;
       ydoc.on('afterTransaction', (txn) => {
@@ -244,7 +247,7 @@ describe('VaultSyncEngine', () => {
         tombstones.set('kept.md', { deletedAt: new Date().toISOString() });
       }, 'remote');
 
-      return { self, vault, tombstones, deleteSpy, remoteTxn: remoteTxn! };
+      return { self, vault, tombstones, deleteSpy, knownLocalMarkdownPaths, remoteTxn: remoteTxn! };
     }
 
     it('does not delete local files for tombstones received before remote delete side effects open', async () => {
@@ -259,13 +262,14 @@ describe('VaultSyncEngine', () => {
     });
 
     it('deletes local files for tombstones received after initial sync completes', async () => {
-      const { self, vault, deleteSpy, remoteTxn } = setupRemoteTombstone(true);
+      const { self, vault, deleteSpy, knownLocalMarkdownPaths, remoteTxn } = setupRemoteTombstone(true);
 
       self.handleRemoteTransactionSideEffects(remoteTxn);
       await flushPromises();
 
       expect(deleteSpy).toHaveBeenCalledTimes(1);
       expect(vault.getFileByPath('kept.md')).toBeNull();
+      expect(knownLocalMarkdownPaths.has('kept.md')).toBe(false);
     });
 
     it('replays read-only startup fileTombstones received while markdown side effects are closed after gate open', async () => {
@@ -983,20 +987,32 @@ describe('VaultSyncEngine', () => {
         };
         plugin: {
           app: {
-            vault: { getMarkdownFiles: () => Array<{ path: string }> };
+            vault: {
+              getMarkdownFiles: () => Array<{ path: string }>;
+              getFileByPath: (path: string) => { path: string; stat: { size: number; mtime: number; ctime: number } } | null;
+              getAbstractFileByPath: (path: string) => { path: string; stat: { size: number; mtime: number; ctime: number } } | null;
+            };
           };
         };
       };
       // Stub out bridge (not initialized without start())
+      const materialized = new Set(localFiles);
       self.bridge = {
         markDirty: () => {},
         drain: async () => {},
-        flushFile: async (p) => { flushed?.push(p); },
+        flushFile: async (p) => {
+          flushed?.push(p);
+          materialized.add(p);
+        },
       };
-      // Stub vault to return only localFiles
+      // Stub vault to return only the startup scan's localFiles; flushFile can materialize files afterwards.
       self.plugin = {
         app: {
-          vault: { getMarkdownFiles: () => localFiles.map((p) => ({ path: p })) },
+          vault: {
+            getMarkdownFiles: () => localFiles.map((p) => ({ path: p })),
+            getFileByPath: (p: string) => materialized.has(p) ? ({ path: p, stat: { size: 0, mtime: 0, ctime: 0 } }) : null,
+            getAbstractFileByPath: (p: string) => materialized.has(p) ? ({ path: p, stat: { size: 0, mtime: 0, ctime: 0 } }) : null,
+          },
         },
       };
       return engine;
@@ -1098,6 +1114,32 @@ describe('VaultSyncEngine', () => {
       expect(pathToId.get('remote.md')).toBe(fid);
     });
 
+    it('defers tombstones when a partial local scan would delete many known markdown paths', async () => {
+      const engine = setupForReconcile(['survivor.md']);
+      const { ydoc, pathToId, idToPath, docs, tombstones, knownLocalMarkdownPaths } = internals(engine);
+      ydoc.transact(() => {
+        pathToId.set('survivor.md', 'file-survivor');
+        idToPath.set('file-survivor', 'survivor.md');
+        docs.set('file-survivor', new Y.Text());
+        for (let i = 0; i < 25; i += 1) {
+          const docPath = `missing-${i}.md`;
+          const fileId = `file-missing-${i}`;
+          pathToId.set(docPath, fileId);
+          idToPath.set(fileId, docPath);
+          docs.set(fileId, new Y.Text());
+          knownLocalMarkdownPaths.add(docPath);
+        }
+      });
+
+      await engine.reconcile();
+
+      for (let i = 0; i < 25; i += 1) {
+        const docPath = `missing-${i}.md`;
+        expect(tombstones.has(docPath)).toBe(false);
+        expect(pathToId.get(docPath)).toBe(`file-missing-${i}`);
+      }
+    });
+
     it('flushes Y.Doc files to disk when local directory is empty (localPath change)', async () => {
       const flushed: string[] = [];
       // Disk is empty — simulates a new mount localPath with no files yet
@@ -1122,6 +1164,77 @@ describe('VaultSyncEngine', () => {
       expect(tombstones.has('note.md')).toBe(false);
       // pathToId entry preserved
       expect(pathToId.get('note.md')).toBe(fid);
+    });
+
+    it('does not remember remote-only markdown as local when initial materialization fails', async () => {
+      const engine = setupForReconcile([]);
+      const { ydoc, pathToId, idToPath, docs, tombstones, knownLocalMarkdownPaths } = internals(engine);
+      const self = engine as unknown as {
+        bridge: {
+          markDirty: (p: string) => void;
+          drain: () => Promise<void>;
+          flushFile: (p: string) => Promise<void>;
+        };
+      };
+      self.bridge = {
+        markDirty: () => {},
+        drain: async () => {},
+        flushFile: async () => { throw new Error('disk unavailable'); },
+      };
+
+      const fid = 'file-remote-fails';
+      ydoc.transact(() => {
+        pathToId.set('remote-fails.md', fid);
+        idToPath.set(fid, 'remote-fails.md');
+        docs.set(fid, new Y.Text());
+      });
+
+      await engine.reconcile();
+
+      expect(knownLocalMarkdownPaths.has('remote-fails.md')).toBe(false);
+      expect(tombstones.has('remote-fails.md')).toBe(false);
+      expect(pathToId.get('remote-fails.md')).toBe(fid);
+    });
+
+    it('does not remember remote-only markdown as local when materialization is skipped', async () => {
+      const engine = setupForReconcile([]);
+      const { ydoc, pathToId, idToPath, docs, tombstones, knownLocalMarkdownPaths } = internals(engine);
+      const self = engine as unknown as {
+        bridge: {
+          markDirty: (p: string) => void;
+          drain: () => Promise<void>;
+          flushFile: (p: string) => Promise<void>;
+        };
+        plugin: {
+          app: {
+            vault: {
+              getMarkdownFiles: () => Array<{ path: string }>;
+              getFileByPath: (path: string) => TFile | null;
+              getAbstractFileByPath: (path: string) => TFile | null;
+            };
+          };
+        };
+      };
+      self.bridge = {
+        markDirty: () => {},
+        drain: async () => {},
+        flushFile: async () => {},
+      };
+      self.plugin.app.vault.getFileByPath = () => null;
+      self.plugin.app.vault.getAbstractFileByPath = () => null;
+
+      const fid = 'file-remote-skipped';
+      ydoc.transact(() => {
+        pathToId.set('remote-skipped.md', fid);
+        idToPath.set(fid, 'remote-skipped.md');
+        docs.set(fid, new Y.Text());
+      });
+
+      await engine.reconcile();
+
+      expect(knownLocalMarkdownPaths.has('remote-skipped.md')).toBe(false);
+      expect(tombstones.has('remote-skipped.md')).toBe(false);
+      expect(pathToId.get('remote-skipped.md')).toBe(fid);
     });
 
     it('converts startup pending deletion to tombstone before materializing remote markdown', async () => {
@@ -2011,6 +2124,7 @@ describe('VaultSyncEngine', () => {
         },
         flushFile: async (path) => {
           flushed.push(path);
+          plugin.app.vault.seedText(path, 'restored content');
         },
       };
       self.blobSync = {
@@ -2058,9 +2172,240 @@ describe('VaultSyncEngine', () => {
       expect(deleted).toEqual(['old.md']);
       expect(flushed).toEqual(['restored.md']);
     });
+
+    it('does not remember restored markdown as local when snapshot materialization fails to create a file', async () => {
+      const plugin = new MockPlugin();
+      const engine = new VaultSyncEngine(plugin as unknown as Plugin, baseSettings(), null);
+      const { knownLocalMarkdownPaths, pathToId, docs, tombstones } = internals(engine);
+      const self = engine as unknown as {
+        bridge: { deleteFile: (path: string) => Promise<void>; flushFile: (path: string) => Promise<void> };
+        blobSync: { deleteLocalBlob: (path: string) => Promise<void>; materializeBlob: (path: string) => Promise<void> };
+        bindAllOpenEditors: () => void;
+        validateAllOpenBindings: () => void;
+      };
+      const flushed: string[] = [];
+      self.bridge = {
+        deleteFile: async () => {},
+        flushFile: async (path) => { flushed.push(path); },
+      };
+      self.blobSync = {
+        deleteLocalBlob: async () => {},
+        materializeBlob: async () => {},
+      };
+      self.bindAllOpenEditors = () => {};
+      self.validateAllOpenBindings = () => {};
+
+      const snapDoc = new Y.Doc();
+      (snapDoc.getMap('pathToId') as Y.Map<string>).set('not-written.md', 'file-not-written');
+      (snapDoc.getMap('idToPath') as Y.Map<string>).set('file-not-written', 'not-written.md');
+      const restoredText = new Y.Text();
+      restoredText.insert(0, 'restored content');
+      (snapDoc.getMap('docs') as Y.Map<Y.Text>).set('file-not-written', restoredText);
+      const payload = Y.encodeStateAsUpdate(snapDoc);
+      const fetchMock = vi.mocked(fetch);
+      fetchMock.mockResolvedValue(
+        new Response(payload as BodyInit, { status: 200, headers: { 'Content-Type': 'application/octet-stream' } }),
+      );
+
+      await engine.restoreSnapshot('snap-failed-materialize');
+
+      expect(flushed).toEqual(['not-written.md']);
+      expect(plugin.app.vault.getFileByPath('not-written.md')).toBeNull();
+      expect(knownLocalMarkdownPaths.has('not-written.md')).toBe(false);
+      expect(tombstones.has('not-written.md')).toBe(false);
+      const restoredFileId = pathToId.get('not-written.md');
+      expect(restoredFileId).toBeDefined();
+      expect(docs.get(restoredFileId!)?.toString()).toBe('restored content');
+    });
   });
 
   describe('markdown pending persistence', () => {
+    it('restores known local markdown paths and tombstones restart-missing files', async () => {
+      const plugin = new MockPlugin();
+      plugin.app.vault.seedText('other.md', 'other content');
+      const engine = new VaultSyncEngine(plugin as unknown as Plugin, baseSettings(), null);
+      const { ydoc, pathToId, idToPath, docs, tombstones, knownLocalMarkdownPaths } = internals(engine);
+      const flushed: string[] = [];
+      const self = engine as unknown as {
+        bridge: {
+          markDirty: (path: string) => void;
+          drain: () => Promise<void>;
+          flushFile: (path: string) => Promise<void>;
+        };
+        markdownPendingStore: {
+          load: () => Promise<{ pendingLocalDeletions: string[]; knownLocalMarkdownPaths?: string[] } | null>;
+          save: (_key: string, state: { pendingLocalDeletions: string[]; knownLocalMarkdownPaths?: string[] }) => Promise<void>;
+        };
+        restoreMarkdownPending: () => Promise<void>;
+      };
+
+      self.bridge = {
+        markDirty: () => {},
+        drain: async () => {},
+        flushFile: async (path) => { flushed.push(path); },
+      };
+      self.markdownPendingStore = {
+        load: async () => ({
+          pendingLocalDeletions: [],
+          knownLocalMarkdownPaths: ['missing-after-restart.md'],
+          vaultId: 'test',
+          updatedAt: '',
+        }),
+        save: vi.fn(async () => {}),
+      };
+      const fid = 'file-missing-after-restart';
+      ydoc.transact(() => {
+        pathToId.set('missing-after-restart.md', fid);
+        idToPath.set(fid, 'missing-after-restart.md');
+        docs.set(fid, new Y.Text());
+      });
+
+      await self.restoreMarkdownPending();
+      await engine.reconcile();
+
+      expect(knownLocalMarkdownPaths.has('missing-after-restart.md')).toBe(false);
+      expect(tombstones.has('missing-after-restart.md')).toBe(true);
+      expect(tombstones.get('missing-after-restart.md')?.deleteSource).toBe('reconcile-missing');
+      expect(pathToId.has('missing-after-restart.md')).toBe(false);
+      expect(flushed).not.toContain('missing-after-restart.md');
+    });
+
+    it('defers restart-missing tombstones when the local markdown scan is empty', async () => {
+      const plugin = new MockPlugin();
+      const engine = new VaultSyncEngine(plugin as unknown as Plugin, baseSettings(), null);
+      const { ydoc, pathToId, idToPath, docs, tombstones, knownLocalMarkdownPaths } = internals(engine);
+      const self = engine as unknown as {
+        bridge: {
+          markDirty: (path: string) => void;
+          drain: () => Promise<void>;
+          flushFile: (path: string) => Promise<void>;
+        };
+        markdownPendingStore: {
+          load: () => Promise<{ pendingLocalDeletions: string[]; knownLocalMarkdownPaths?: string[] } | null>;
+          save: (_key: string, state: { pendingLocalDeletions: string[]; knownLocalMarkdownPaths?: string[] }) => Promise<void>;
+        };
+        restoreMarkdownPending: () => Promise<void>;
+      };
+      self.bridge = {
+        markDirty: () => {},
+        drain: async () => {},
+        flushFile: async () => {},
+      };
+      self.markdownPendingStore = {
+        load: async () => ({
+          pendingLocalDeletions: [],
+          knownLocalMarkdownPaths: ['missing-while-empty.md'],
+          vaultId: 'test',
+          updatedAt: '',
+        }),
+        save: vi.fn(async () => {}),
+      };
+      const fid = 'file-missing-while-empty';
+      ydoc.transact(() => {
+        pathToId.set('missing-while-empty.md', fid);
+        idToPath.set(fid, 'missing-while-empty.md');
+        docs.set(fid, new Y.Text());
+      });
+
+      await self.restoreMarkdownPending();
+      await engine.reconcile();
+
+      expect(knownLocalMarkdownPaths.has('missing-while-empty.md')).toBe(true);
+      expect(tombstones.has('missing-while-empty.md')).toBe(false);
+      expect(pathToId.get('missing-while-empty.md')).toBe(fid);
+    });
+
+    it('does not restore known local markdown paths from a different shared mount localPath', async () => {
+      const plugin = new MockPlugin();
+      const mount: SharedDirectoryMount = {
+        localPath: 'NewShared',
+        vaultId: 'shared-vault',
+        token: 'shared-token',
+      };
+      const engine = new VaultSyncEngine(plugin as unknown as Plugin, baseSettings(), mount);
+      const { ydoc, pathToId, idToPath, docs, tombstones, knownLocalMarkdownPaths } = internals(engine);
+      const flushed: string[] = [];
+      const self = engine as unknown as {
+        bridge: {
+          markDirty: (path: string) => void;
+          drain: () => Promise<void>;
+          flushFile: (path: string) => Promise<void>;
+        };
+        markdownPendingStore: {
+          load: () => Promise<{ pendingLocalDeletions: string[]; knownLocalMarkdownPaths?: string[]; localPath?: string } | null>;
+          save: (_key: string, state: { pendingLocalDeletions: string[]; knownLocalMarkdownPaths?: string[]; localPath?: string }) => Promise<void>;
+        };
+        restoreMarkdownPending: () => Promise<void>;
+      };
+
+      self.bridge = {
+        markDirty: () => {},
+        drain: async () => {},
+        flushFile: async (path) => {
+          flushed.push(path);
+          plugin.app.vault.seedText(`NewShared/${path}`, 'remote content');
+        },
+      };
+      self.markdownPendingStore = {
+        load: async () => ({
+          pendingLocalDeletions: [],
+          knownLocalMarkdownPaths: ['old-mount.md'],
+          localPath: 'OldShared',
+          vaultId: 'test',
+          updatedAt: '',
+        }),
+        save: vi.fn(async () => {}),
+      };
+      const fid = 'file-old-mount';
+      ydoc.transact(() => {
+        pathToId.set('old-mount.md', fid);
+        idToPath.set(fid, 'old-mount.md');
+        docs.set(fid, new Y.Text());
+      });
+
+      await self.restoreMarkdownPending();
+      await engine.reconcile();
+
+      expect(knownLocalMarkdownPaths.has('old-mount.md')).toBe(true);
+      expect(tombstones.has('old-mount.md')).toBe(false);
+      expect(pathToId.get('old-mount.md')).toBe(fid);
+      expect(flushed).toEqual(['old-mount.md']);
+    });
+
+    it('persists local delete cleanup after tombstone commit removes known path', async () => {
+      const plugin = new MockPlugin();
+      const engine = new VaultSyncEngine(plugin as unknown as Plugin, baseSettings(), null);
+      const { ydoc, pathToId, idToPath, docs, tombstones, knownLocalMarkdownPaths } = internals(engine);
+      const savedStates: Array<{ pendingLocalDeletions: string[]; knownLocalMarkdownPaths?: string[] }> = [];
+      const self = engine as unknown as {
+        markdownPendingStore: {
+          load: () => Promise<{ pendingLocalDeletions: string[] } | null>;
+          save: (_key: string, state: { pendingLocalDeletions: string[]; knownLocalMarkdownPaths?: string[] }) => Promise<void>;
+        };
+        cache: { save: () => Promise<void> };
+        flushCacheSave: () => Promise<void>;
+      };
+      const fid = 'file-delete-known';
+      ydoc.transact(() => {
+        pathToId.set('delete-known.md', fid);
+        idToPath.set(fid, 'delete-known.md');
+        docs.set(fid, new Y.Text());
+      });
+      knownLocalMarkdownPaths.add('delete-known.md');
+      self.cache = { save: vi.fn(async () => {}) };
+      self.markdownPendingStore = {
+        load: async () => ({ pendingLocalDeletions: [], vaultId: 'test', updatedAt: '' }),
+        save: vi.fn(async (_key, state) => { savedStates.push(state); }),
+      };
+
+      engine.handleLocalFileDeletion('delete-known.md');
+      await self.flushCacheSave();
+
+      expect(tombstones.has('delete-known.md')).toBe(true);
+      expect(knownLocalMarkdownPaths.has('delete-known.md')).toBe(false);
+      expect(savedStates.at(-1)?.knownLocalMarkdownPaths).not.toContain('delete-known.md');
+    });
+
     it('pending local markdown deletions survive engine restart via markdownPendingStore', async () => {
       const plugin = new MockPlugin();
       const engine = new VaultSyncEngine(plugin as unknown as Plugin, baseSettings(), null);
