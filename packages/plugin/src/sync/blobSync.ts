@@ -183,7 +183,7 @@ export class BlobSync {
 
     // 无论 ref 是否在 shared model，都先登记 pending，确保启动窗口期的 delete 不丢。
     this.pendingLocalDeletions.set(path, knownHash);
-    if (knownHash != null && !this.pathToBlob.has(path)) {
+    if (knownHash != null) {
       this.pendingLocalDeletionFirstSeenAt.set(path, new Date().toISOString());
     }
     this.notifyPendingLocalDeletionsChange();
