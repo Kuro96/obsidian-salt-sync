@@ -1502,6 +1502,63 @@ describe('BlobSync reconcile', () => {
     expect(sync.getPendingBlobItems()).toEqual([]);
   });
 
+  it('does not run candidate expiry fallback after stop()', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+    const vault = new MockVault();
+    const ydoc = new Y.Doc();
+    const bytes = new Uint8Array([6, 8, 6]);
+    const hash = sha256hex(bytes);
+    const file = vault.seedBinary('assets/stopped-expiry.png', bytes);
+    const runtime = createRuntimeStateStore();
+
+    const sync = new BlobSync(
+      'ws://server.test',
+      'vault-a',
+      'token-a',
+      vault as never,
+      ydoc,
+      undefined,
+      undefined,
+      undefined,
+      runtime.store,
+    );
+
+    await vault.delete(file);
+    await sync.handleLocalBlobDeletion('assets/stopped-expiry.png');
+
+    let remoteTxn: Y.Transaction | null = null;
+    ydoc.on('afterTransaction', (txn) => {
+      if (txn.origin === 'remote') remoteTxn = txn;
+    });
+    ydoc.transact(() => {
+      (ydoc.getMap('pathToBlob') as Y.Map<{ hash: string; size: number; updatedAt: string }>).set('assets/stopped-expiry.png', {
+        hash,
+        size: bytes.byteLength,
+        updatedAt: new Date().toISOString(),
+      });
+    }, 'remote');
+    await sync.handleRemoteBlobChanges(remoteTxn!);
+    await sync.openRemoteApplyGate();
+
+    sync.stop();
+    fetchMock.mockClear();
+    fetchMock.mockImplementation(async () => {
+      throw new Error('candidate expiry should not download after stop');
+    });
+
+    await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+    await sync.flushPersistChain();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(vault.getFileByPath('assets/stopped-expiry.png')).toBeNull();
+    expect(runtime.snapshot()?.pendingMissingBlobs?.[0]).toMatchObject({
+      docPath: 'assets/stopped-expiry.png',
+      remoteHashAtCreation: hash,
+      reason: 'pending-null-hash',
+    });
+  });
+
   it('keeps expired candidate state when its fallback download fails', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
@@ -2087,7 +2144,7 @@ describe('BlobSync reconcile', () => {
     const lastSaveHadUpsert = saves.some((s) => s.pendingLocalUpserts.includes('assets/chain.png'));
     expect(lastSaveHadUpsert).toBe(true);
     // 现在成功后会保留 knownLocalPaths，用于跨会话识别“曾在本地、随后被删除”的 blob。
-    expect(saves.at(-1)).toMatchObject({
+    expect(saves[saves.length - 1]).toMatchObject({
       pendingLocalUpserts: [],
       pendingLocalDeletions: [],
       pendingRemoteDeletes: [],

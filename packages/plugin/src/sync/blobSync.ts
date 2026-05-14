@@ -118,6 +118,7 @@ export class BlobSync {
   private readonly pendingLocalDeletions = new Map<string, string | null>();
   private readonly pendingLocalDeletionFirstSeenAt = new Map<string, string>();
   private readonly candidateExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private stopped = false;
   private gateState: BlobApplyGateState = 'startup-blocked';
   private runtimeStateRestored = false;
   private persistChain: Promise<void> = Promise.resolve();
@@ -269,6 +270,15 @@ export class BlobSync {
     });
   }
 
+  stop(): void {
+    if (this.stopped) return;
+    this.stopped = true;
+    for (const timer of this.candidateExpiryTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.candidateExpiryTimers.clear();
+  }
+
   enterStartupGate(): void {
     this.gateState = 'startup-blocked';
   }
@@ -386,6 +396,7 @@ export class BlobSync {
     if (this.runtimeStateRestored) return;
     this.runtimeStateRestored = true;
     const restored = await this.runtimeStateStore.load(this.runtimeStateKey);
+    if (this.stopped) return;
     if (!restored) return;
 
     // 主 vault（两端均为 undefined）视为路径匹配，保持原有行为。
@@ -613,12 +624,14 @@ export class BlobSync {
   }
 
   private scheduleMissingBlobCandidateExpiry(candidate: PendingMissingBlob): void {
+    if (this.stopped) return;
     this.clearMissingBlobCandidateTimer(candidate.docPath);
     const firstSeenAt = Date.parse(candidate.firstSeenAt);
     const elapsed = Number.isFinite(firstSeenAt) ? Date.now() - firstSeenAt : DEFAULT_MISSING_BLOB_CANDIDATE_TTL_MS;
     const delay = Math.max(0, DEFAULT_MISSING_BLOB_CANDIDATE_TTL_MS - elapsed);
     const timer = setTimeout(() => {
       this.candidateExpiryTimers.delete(candidate.docPath);
+      if (this.stopped) return;
       void this.resolveExpiredMissingBlobCandidate(candidate.docPath);
     }, delay);
     (timer as { unref?: () => void }).unref?.();
@@ -626,6 +639,7 @@ export class BlobSync {
   }
 
   private async resolveExpiredMissingBlobCandidate(docPath: string): Promise<void> {
+    if (this.stopped) return;
     const candidate = this.pendingMissingBlobs.get(docPath);
     if (!candidate) return;
     if (!this.candidateExpired(candidate)) {
@@ -645,6 +659,7 @@ export class BlobSync {
     let pendingDownloadRemoved = false;
     try {
       await this.enqueuePathOperation(docPath, async () => {
+        if (this.stopped) return;
         const currentRef = this.pathToBlob.get(docPath);
         if (!currentRef || currentRef.hash !== ref.hash || this.blobTombstones.has(docPath)) {
           if (this.deletePendingLocalDeletion(docPath)) {
