@@ -1953,6 +1953,7 @@ describe('VaultSyncEngine', () => {
           onPendingUploadsChange: () => void;
           onPendingRemoteDeletesChange: () => void;
           onPendingLocalDeletionsChange: () => void;
+          stop: Mock;
           handleLocalBlobDeletion: Mock;
           handleLocalBlobChange: Mock;
         };
@@ -1985,6 +1986,7 @@ describe('VaultSyncEngine', () => {
 
       const blobDeletion = vi.fn(async () => {});
       const blobChange = vi.fn(async () => {});
+      const blobStop = vi.fn();
 
       self.client = {
         connect: async () => {},
@@ -1999,6 +2001,7 @@ describe('VaultSyncEngine', () => {
         onPendingUploadsChange: () => {},
         onPendingRemoteDeletesChange: () => {},
         onPendingLocalDeletionsChange: () => {},
+        stop: blobStop,
         handleLocalBlobDeletion: blobDeletion,
         handleLocalBlobChange: blobChange,
       };
@@ -2028,8 +2031,17 @@ describe('VaultSyncEngine', () => {
       self.notifyStatusChange = () => {};
       self.statusHandlers = [];
 
-      return { plugin, engine, self, blobDeletion, blobChange };
+      return { plugin, engine, self, blobDeletion, blobChange, blobStop };
     }
+
+    it('stops BlobSync lifecycle work when engine stops', async () => {
+      const { engine, blobStop } = setupWithMockPlugin();
+
+      await engine.stop();
+      await engine.stop();
+
+      expect(blobStop).toHaveBeenCalledTimes(1);
+    });
 
     it('vault rename event does not write tombstone after stop()', async () => {
       const { plugin, engine } = setupWithMockPlugin();
@@ -2513,7 +2525,7 @@ describe('VaultSyncEngine', () => {
 
       expect(tombstones.has('delete-known.md')).toBe(true);
       expect(knownLocalMarkdownPaths.has('delete-known.md')).toBe(false);
-      expect(savedStates.at(-1)?.knownLocalMarkdownPaths).not.toContain('delete-known.md');
+      expect(savedStates[savedStates.length - 1]?.knownLocalMarkdownPaths).not.toContain('delete-known.md');
     });
 
     it('pending local markdown deletions survive engine restart via markdownPendingStore', async () => {

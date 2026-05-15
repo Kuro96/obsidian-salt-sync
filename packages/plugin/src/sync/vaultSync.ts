@@ -617,6 +617,7 @@ export class VaultSyncEngine implements SyncEngine {
   async stop(): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
+    (this.blobSync as { stop?: () => void } | undefined)?.stop?.();
     if (this.healthCheckTimer) {
       clearInterval(this.healthCheckTimer);
       this.healthCheckTimer = null;
