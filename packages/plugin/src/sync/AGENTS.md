@@ -41,6 +41,7 @@ Core sync domain. One `VaultSyncEngine` runs per primary vault or shared mount a
 - `pendingLocalDeletions.hash === null` must not borrow a future remote hash.
 - `BlobRef.updatedAt` is metadata, not causal version evidence.
 - Ignored paths must not enter CRDT maps, runtime state, local imports, or local deletes.
+- Shared mount enablement is opt-out: only `enabled === false` disables a mount. Use `isSharedMountEnabled()` / `normalizeSharedMountsForRuntime()` instead of truthy checks.
 
 ## Y.DOC ORIGINS
 
