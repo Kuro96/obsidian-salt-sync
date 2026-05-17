@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { SyncManager } from '../../src/sync/syncManager';
 import type { SaltSyncSettings } from '../../src/settings';
 import type { Plugin } from 'obsidian';
@@ -50,6 +50,19 @@ describe('SyncManager.getAvailableScopes', () => {
     expect(scopes[1].label).toBe('Work');
   });
 
+  it('treats missing mount enabled as enabled', () => {
+    const settings = baseSettings({
+      vaultSyncEnabled: false,
+      sharedMounts: [
+        { localPath: 'Shared', vaultId: 'shared-vault', token: 'shared-token' },
+      ],
+    });
+    const mgr = new SyncManager(fakePlugin(), settings);
+    const scopes = mgr.getAvailableScopes();
+    expect(scopes).toHaveLength(1);
+    expect(scopes[0].label).toBe('Shared');
+  });
+
   it('primary comes first when both primary and mounts are enabled', () => {
     const settings = baseSettings({
       vaultSyncEnabled: true,
@@ -92,6 +105,18 @@ describe('SyncManager mount validation', () => {
       sharedMounts: [
         { enabled: true, localPath: 'Shared', vaultId: 'a', token: 'ta' },
         { enabled: true, localPath: 'Shared/', vaultId: 'b', token: 'tb' },
+      ],
+    });
+
+    expect(() => new SyncManager(fakePlugin(), settings)).toThrow(/不能重叠/);
+  });
+
+  it('rejects duplicate mount paths when enabled is omitted', () => {
+    const settings = baseSettings({
+      vaultSyncEnabled: false,
+      sharedMounts: [
+        { localPath: 'Shared', vaultId: 'a', token: 'ta' },
+        { localPath: 'Shared/', vaultId: 'b', token: 'tb' },
       ],
     });
 
@@ -201,6 +226,14 @@ describe('SyncManager.hasAnySync', () => {
     const settings = baseSettings({
       vaultSyncEnabled: false,
       sharedMounts: [{ enabled: true, localPath: 'S', vaultId: 'sv', token: 't' }],
+    });
+    expect(new SyncManager(fakePlugin(), settings).hasAnySync).toBe(true);
+  });
+
+  it('true when only mount omits enabled', () => {
+    const settings = baseSettings({
+      vaultSyncEnabled: false,
+      sharedMounts: [{ localPath: 'S', vaultId: 'sv', token: 't' }],
     });
     expect(new SyncManager(fakePlugin(), settings).hasAnySync).toBe(true);
   });

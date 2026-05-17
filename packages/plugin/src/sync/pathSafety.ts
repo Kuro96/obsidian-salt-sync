@@ -1,13 +1,14 @@
 import type { SharedDirectoryMount } from '@salt-sync/shared';
 export { isPathIgnoredBySync, isSameOrChildPath, normalizeVaultPath } from '@salt-sync/shared';
 import { isPathIgnoredBySync, isSameOrChildPath, normalizeVaultPath } from '@salt-sync/shared';
+import { isSharedMountEnabled } from './sharedMounts';
 
 export function validateSharedMountOverlaps(
   mounts: SharedDirectoryMount[],
 ): { ok: true } | { ok: false; message: string } {
   const enabled = mounts
     .map((mount, index) => ({ mount, index, localPath: normalizeVaultPath(mount.localPath) }))
-    .filter(({ mount }) => mount.enabled !== false);
+    .filter(({ mount }) => isSharedMountEnabled(mount));
 
   for (const item of enabled) {
     if (!item.localPath) {

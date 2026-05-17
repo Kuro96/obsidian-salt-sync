@@ -5,6 +5,7 @@ import type { SaltSyncSettings } from '../settings';
 import { VaultSyncEngine } from './vaultSync';
 import type { SnapshotManifest, DownloadedFile, SyncStatus } from './vaultSync';
 import { isSameOrChildPath, normalizeVaultPath, validateSharedMountOverlaps } from './pathSafety';
+import { isSharedMountEnabled } from './sharedMounts';
 
 // ── SyncScope ─────────────────────────────────────────────────────────────────
 
@@ -57,7 +58,7 @@ export class SyncManager {
 
   constructor(plugin: Plugin, settings: SaltSyncSettings) {
     const enabledMounts = (settings.sharedMounts ?? [])
-      .filter((mount) => mount.enabled)
+      .filter(isSharedMountEnabled)
       .map((mount) => ({ ...mount, localPath: normalizeVaultPath(mount.localPath) }));
     const overlapValidation = validateSharedMountOverlaps(settings.sharedMounts ?? []);
     if (!overlapValidation.ok) {

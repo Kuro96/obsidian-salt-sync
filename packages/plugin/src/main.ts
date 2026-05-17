@@ -9,6 +9,7 @@ import { SnapshotPickerModal } from './ui/snapshotPickerModal';
 import { SnapshotDetailModal } from './ui/snapshotDetailModal';
 import { ScopePickerModal } from './ui/scopePickerModal';
 import { DiffPreviewModal } from './ui/diffPreviewModal';
+import { isSharedMountEnabled, normalizeSharedMountsForRuntime } from './sync/sharedMounts';
 
 export default class SaltSyncPlugin extends Plugin {
   settings!: SaltSyncSettings;
@@ -123,7 +124,7 @@ export default class SaltSyncPlugin extends Plugin {
   }
 
   private async startSyncNow(): Promise<void> {
-    const enabledMounts = (this.settings.sharedMounts ?? []).filter((mount) => mount.enabled);
+    const enabledMounts = (this.settings.sharedMounts ?? []).filter(isSharedMountEnabled);
     const needsDefaultServerUrl = this.settings.vaultSyncEnabled || enabledMounts.some((mount) => !mount.serverUrl?.trim());
 
     if (this.manager) return;
@@ -205,11 +206,11 @@ export default class SaltSyncPlugin extends Plugin {
 
   async loadSettings(): Promise<void> {
     const saved = (await this.loadData()) as Partial<SaltSyncSettings> & { deviceId?: string } | null;
-    const legacySharedMountSyncEnabled = saved?.sharedMountSyncEnabled ?? saved?.enabled ?? false;
-    const sharedMounts = (saved?.sharedMounts ?? DEFAULT_SETTINGS.sharedMounts ?? []).map((mount) => ({
-      ...mount,
-      enabled: mount.enabled ?? legacySharedMountSyncEnabled,
-    }));
+    const legacySharedMountSyncEnabled = typeof saved?.sharedMountSyncEnabled === 'boolean'
+      ? saved.sharedMountSyncEnabled
+      : undefined;
+    const savedSharedMounts = saved?.sharedMounts ?? DEFAULT_SETTINGS.sharedMounts ?? [];
+    const sharedMounts = normalizeSharedMountsForRuntime(savedSharedMounts, legacySharedMountSyncEnabled);
 
     this.settings = { ...DEFAULT_SETTINGS, ...saved, sharedMounts };
     this.settings.ignoreFilePath = this.settings.ignoreFilePath?.trim().replace(/\\/g, '/').replace(/^\.\/+/g, '') ?? '';
@@ -223,6 +224,14 @@ export default class SaltSyncPlugin extends Plugin {
     this.settings.deviceId = await resolveDeviceId(saved?.deviceId ?? undefined);
 
     let needsSave = false;
+
+    if (
+      saved?.enabled !== undefined
+      || saved?.sharedMountSyncEnabled !== undefined
+      || savedSharedMounts.some((mount) => mount.enabled === undefined)
+    ) {
+      needsSave = true;
+    }
 
     const legacyName = (saved as { deviceName?: string } | null)?.deviceName ?? '';
     if (legacyName && !this.settings.deviceNames?.[this.settings.deviceId]) {
@@ -277,7 +286,7 @@ export default class SaltSyncPlugin extends Plugin {
   }
 
   private shouldStartAnySync(): boolean {
-    return this.settings.vaultSyncEnabled || (this.settings.sharedMounts ?? []).some((mount) => mount.enabled);
+    return this.settings.vaultSyncEnabled || (this.settings.sharedMounts ?? []).some(isSharedMountEnabled);
   }
 
   async saveSettings(): Promise<void> {
