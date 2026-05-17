@@ -1,93 +1,125 @@
-# CLAUDE.md
+# PROJECT KNOWLEDGE BASE
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+**Generated:** 2026-05-17
+**Commit:** ec1cb51
+**Branch:** master
 
-## Build & Test Commands
+## OVERVIEW
 
-```bash
-# Build all packages
-corepack pnpm --filter @salt-sync/{shared,server,plugin} build
+Salt Sync is a pnpm workspace for an Obsidian real-time sync plugin, a Node WebSocket/HTTP server, and a shared protocol/type package. Core stack: TypeScript, Yjs CRDT, Obsidian API, CodeMirror 6, SQLite, S3/MinIO, Vitest, esbuild.
 
-# Type check all packages
-corepack pnpm -r typecheck
+## STRUCTURE
 
-# Run all tests
-corepack pnpm -r test
-
-# Plugin bundle safety gate
-corepack pnpm --filter @salt-sync/plugin build
-corepack pnpm --filter @salt-sync/plugin check:bundle-safety
+```text
+obsidian-salt-sync/
+|-- packages/shared/   # protocol, frame format, shared types, path rules
+|-- packages/server/   # WebSocket/HTTP sync server, persistence, S3, admin API
+|-- packages/plugin/   # Obsidian plugin, sync engines, UI, IndexedDB cache
+|-- docs/              # architecture notes and local get-started guide
+|-- docker/            # full local stack compose + server Dockerfile
+|-- deploy/nginx/      # public reverse-proxy template
+`-- docker-compose.yml # MinIO-only local helper
 ```
 
-Always use `corepack pnpm` (not bare `pnpm`).
+## WHERE TO LOOK
 
-## Architecture
+| Task | Location | Notes |
+|------|----------|-------|
+| Workspace scripts | `package.json` | Root only orchestrates packages. |
+| Shared protocol/types | `packages/shared/src/` | Single source of truth for server + plugin. |
+| Binary WS frames | `packages/shared/src/framing.ts` | Keep tag mapping symmetric. |
+| Server startup | `packages/server/src/index.ts` | Env, SQLite/WAL, S3, room manager. |
+| HTTP + WS composition | `packages/server/src/app.ts` | Route order and hello/auth handshake. |
+| Server room state | `packages/server/src/rooms/vaultRoom.ts` | Y.Doc persistence, awareness, snapshots. |
+| Admin API | `packages/server/src/admin/adminApiRouter.ts` | Tokens, snapshots, GC, cleanup. |
+| Obsidian plugin entry | `packages/plugin/src/main.ts` | Commands, lifecycle, settings tab. |
+| Sync engine | `packages/plugin/src/sync/vaultSync.ts` | Y.Doc, startup, markdown/blob orchestration. |
+| Blob sync | `packages/plugin/src/sync/blobSync.ts` | Attachment sync and deletion evidence. |
+| Markdown disk bridge | `packages/plugin/src/sync/filesystemBridge.ts` | Disk <-> CRDT, write queues, echo suppression. |
+| Editor binding | `packages/plugin/src/sync/editorBinding.ts` | CM6/yCollab binding health and repair. |
+| Plugin persistence | `packages/plugin/src/storage/indexedDbStore.ts` | Local cache, pending state, runtime state. |
+| Plugin e2e | `packages/plugin/test/e2e/twoEngine.test.ts` | Cross-stack wiring; MinIO branches skip if unavailable. |
+| Server integration | `packages/server/test/integration/` | HTTP/WS/S3/admin API behavior. |
 
-### Monorepo layout
+## CODE MAP
 
-- **`packages/shared`** — Types, protocol definitions, interfaces, constants, binary framing. Single source of truth for the WebSocket protocol and data model. Both server and plugin depend on this.
-- **`packages/server`** — WebSocket server: SQLite+WAL persistence for Y.Doc state, S3 for blobs and snapshots, Express HTTP for blob upload/download and admin.
-- **`packages/plugin`** — Obsidian plugin client: real-time sync via Yjs CRDT, CodeMirror 6 editor binding, IndexedDB local cache.
+| Symbol | Type | Location | Role |
+|--------|------|----------|------|
+| `SaltSyncPlugin` | class | `packages/plugin/src/main.ts` | Obsidian plugin shell and command registration. |
+| `SyncManager` | class | `packages/plugin/src/sync/syncManager.ts` | Primary vault + shared mount engine lifecycle. |
+| `VaultSyncEngine` | class | `packages/plugin/src/sync/vaultSync.ts` | One sync scope, owns Y.Doc and all sync subsystems. |
+| `BlobSync` | class | `packages/plugin/src/sync/blobSync.ts` | Attachment upload/download/tombstone/runtime state. |
+| `ObsidianFilesystemBridge` | class | `packages/plugin/src/sync/filesystemBridge.ts` | Markdown disk/CRDT bridge. |
+| `EditorBindingManager` | class | `packages/plugin/src/sync/editorBinding.ts` | CM6/yCollab binding manager. |
+| `RoomClient` | class | `packages/plugin/src/sync/roomClient.ts` | Binary WebSocket client. |
+| `createApp` | function | `packages/server/src/app.ts` | HTTP routes + WS upgrade composition. |
+| `VaultRoom` | class | `packages/server/src/rooms/vaultRoom.ts` | Server-side room Y.Doc, persistence, broadcast. |
+| `RoomManager` | class | `packages/server/src/rooms/roomManager.ts` | Lazy room cache and idle disposal. |
+| `SqliteDocumentStore` | class | `packages/server/src/persistence/sqliteDocumentStore.ts` | Checkpoint+journal persistence. |
+| `AdminApiRouter` | class | `packages/server/src/admin/adminApiRouter.ts` | Protected admin API. |
+| `encodeFrame` / `decodeFrame` | functions | `packages/shared/src/framing.ts` | Transport frame codec. |
 
-### Plugin sync architecture (the complex part)
+## CONVENTIONS
 
-The plugin runs one `VaultSyncEngine` per sync scope (primary vault + one per shared directory mount). Each engine owns:
+- Always use `corepack pnpm`, not bare `pnpm`.
+- Workspace scope is only `packages/*`; generated `dist/`, `data/`, `tmp/`, and `.opencode/` are not product source.
+- Root `package.json` orchestrates; package-specific behavior lives in each package's `package.json`.
+- `shared` and `server` are ESM/Node16; `plugin` uses ESNext + Bundler + DOM/JSX for Obsidian/esbuild.
+- No project references or path aliases; cross-package imports go through workspace packages, not deep source paths.
+- Tests use Vitest with `test/**/*.test.ts`; plugin aliases `obsidian` to `test/mocks/obsidian.ts`.
+- Path names are precise: `vaultPath` includes the Obsidian mount prefix; `docPath` is the shared-model path after stripping the mount prefix.
+- Y.Doc origin strings are semantic control flow. Do not rename or collapse them casually: `remote`, `cache`, `load`, `local-disk`, `local-meta`, `local-blob`, `local-rename`, `local-delete`, `restore`.
+- When changing structure, commands, tests, protocol boundaries, or sync invariants, update the nearest relevant `AGENTS.md` in the same change.
 
-1. **RoomClient** — WebSocket connection with auto-reconnect. Binary frame protocol (shared `encodeFrame`/`decodeFrame`). Auth handshake → `auth_ok` → state vector exchange → incremental `sync_update` messages.
+## ANTI-PATTERNS
 
-2. **Y.Doc** — The CRDT document containing four key Y.Maps:
-   - `pathToId` / `idToPath` — Markdown file path ↔ fileId mapping
-   - `docs` — fileId → `Y.Text` (markdown content)
-   - `fileTombstones` — Markdown deletion markers
-   - `pathToBlob` — Attachment path → `BlobRef` (hash, size, contentType)
-   - `blobTombstones` — Attachment deletion markers
+- Do not use `knownLocalPaths` alone to confirm a blob tombstone. Path-only evidence is weak.
+- Do not let `pendingLocalDeletions.hash === null` borrow a later remote hash.
+- Do not tombstone a remote blob when evidence hash and current `pathToBlob` hash differ.
+- Do not create a new blob tombstone without a current matching remote ref.
+- Do not import, write, delete, or persist ignored paths such as Obsidian internals and Syncthing temp/conflict files.
+- Do not treat `readOnly` shared mounts as strict local mirrors; they do not delete local extra files.
+- Do not bundle Obsidian/Electron/CM6/Lezer into the plugin bundle. Run `check:bundle-safety` after plugin builds.
+- Do not assume `/admin` HTML is protected. Protected surface is `/admin/api/*`.
 
-3. **ObsidianFilesystemBridge** — Bidirectional sync between Y.Doc and disk for markdown:
-   - Disk → CRDT: `markDirty` → debounced `drain` → `importFromDisk` (diff-based via `fast-diff`)
-   - CRDT → Disk: `flushFile` → `vault.modify`/`vault.create`
-   - Open/closed file split, deferred import, recent-editor-activity protection
-   - Self-echo suppression via SHA-256 fingerprinting (`expectedWrites`, `expectedDeletes`)
-   - Per-path write queue serialization
+## COMMANDS
 
-4. **EditorBindingManager** — Host CM6 + `yCollab` integration for live editing. Tracks live `EditorView`s, binds via `Compartment.reconfigure(...)`, and supports health check / heal / rebind.
+```bash
+corepack pnpm install --frozen-lockfile
+corepack pnpm build
+corepack pnpm -r typecheck
+corepack pnpm -r test
 
-5. **BlobSync** — Attachment sync with its own complexity:
-   - Three-state gate: `startup-blocked` → `maintenance-blocked` → `open`
-   - Per-path operation queue (`enqueuePathOperation`) for serializing upsert/delete races
-   - `pendingLocalDeletions` for startup-window deletions (before shared model is synced)
-   - `persistChain` for serialized IDB writes of runtime state
-   - Hash cache (in-memory, mtime+size keyed) to avoid redundant SHA-256 computations
-   - Startup flow: `enterStartupGate` → `restoreRuntimeState` (merge semantics) → `reconcile` → `openRemoteApplyGate`
+corepack pnpm --filter @salt-sync/shared build
+corepack pnpm --filter @salt-sync/server build
+corepack pnpm --filter @salt-sync/plugin build
+corepack pnpm --filter @salt-sync/plugin check:bundle-safety
 
-### Startup sequence
+SERVER_TOKEN=dev-token corepack pnpm dev:server
+corepack pnpm --filter @salt-sync/server dev
+corepack pnpm --filter @salt-sync/plugin dev
 
-1. Construct `BlobSync`, enter startup gate
-2. Load local IDB cache → `Y.applyUpdate(ydoc, cached, 'cache')`
-3. Register `ydoc.on('update')` (outbound) and `ydoc.on('afterTransaction')` (inbound)
-4. Connect WebSocket, register vault file events
-5. `auth_ok` → send state vector → await initial `sync_update`
-6. `completeInitialSync` → `reconcile` (markdown) → `runBlobMaintenance` (restore → reconcile → open gate) → `bindAllOpenEditors` → `validateAllOpenBindings`
+docker compose up -d
+docker compose -f docker/docker-compose.yml up -d --build
+```
 
-### Key design invariants
+## TEST TARGETS
 
-- **Y.Doc origins**: `'remote'` (server), `'cache'` (IDB restore), `'local-disk'` (import from disk), `'local-meta'` (path map changes), `'local-blob'` (blob transacts), `'local-rename'`, `'local-delete'`, `'restore'`. Update handlers filter on origin.
-- **Markdown deletion compensation is conservative**: only markdown paths known to have existed locally on this device may be tombstoned during reconcile / external deletion handling; do not treat pure remote files on a new device as local deletes.
-- **Tombstone wins**: When `pathToBlob` and `blobTombstones` have the same key (cross-device LWW), tombstone takes precedence — no download.
-- **Pending deletions flush before remote apply**: `openRemoteApplyGate` calls `flushPendingLocalDeletions` before `flushPendingRemoteChanges` to prevent resurrection.
-- **reconcile/rescan also flushes pending deletions first** (entry of `syncLocalAndRemoteBlobs`).
+```bash
+corepack pnpm --filter @salt-sync/shared test -- test/framing.test.ts
+corepack pnpm --filter @salt-sync/server test -- test/integration/ws.test.ts
+corepack pnpm --filter @salt-sync/server test -- test/integration/blobs.test.ts
+corepack pnpm --filter @salt-sync/plugin test -- test/unit/vaultSync.test.ts
+corepack pnpm --filter @salt-sync/plugin test -- test/unit/blobSync.test.ts
+corepack pnpm --filter @salt-sync/plugin test -- test/e2e/twoEngine.test.ts
+```
 
-### Testing
+## NOTES
 
-- Plugin tests mock Obsidian APIs via `test/mocks/obsidian.ts` (`MockVault`, `MockWorkspace`, `requestUrl` wrapping `fetch`)
-- vitest config aliases `obsidian` → the mock module
-- Blob sync tests use `fake-indexeddb` for IDB and `vi.stubGlobal('fetch', fetchMock)` for HTTP
-- `packages/plugin/test/e2e/twoEngine.test.ts` is the main cross-stack wiring test: text sync, delete, rename, reconnect catch-up, startup binding, stale binding rebind, snapshot restore propagation, plus blob/snapshot flows when MinIO is available
-- `packages/plugin/scripts/check-bundle-safety.mjs` is the bundle gate for CM6 externalization and dynamic import regressions
-
-### Path semantics
-
-Two path systems throughout the codebase:
-- **vaultPath** — Full Obsidian vault-relative path (includes mount prefix)
-- **docPath** — Shared model path (mount prefix stripped)
-
-`toDocPath` / `toVaultPath` are injected at construction. For the primary vault they're identity functions.
+- Node requirement is `>=22 <25`; CI uses Node 22 and pnpm 9.
+- Plugin release artifacts are `packages/plugin/dist/main.js`, `packages/plugin/manifest.json`, and `packages/plugin/styles.css`.
+- `packages/server` build is `tsc` plus an esbuild bundle for `admin-src/main.tsx`.
+- `pnpm dev:server` watches server source but does not build the admin bundle first.
+- MinIO defaults: S3 API `http://localhost:19000`, console `http://localhost:19001`, credentials `minioadmin/minioadmin`.
+- Release tags use bare semver such as `0.4.1`, not `v0.4.1`.
+- Active local planning context may exist under `.opencode/plans/*`; treat it as working context, not product docs.
