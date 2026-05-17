@@ -5,6 +5,7 @@ import { Toggle } from './common/Toggle';
 import { useSyncStatus } from './common/useSyncStatus';
 import { SyncStatusBadge } from './common/SyncStatusBadge';
 import { normalizeVaultPath, validateSharedMountOverlaps } from '../sync/pathSafety';
+import { isSharedMountEnabled } from '../sync/sharedMounts';
 
 interface Props {
   mounts: SharedDirectoryMount[];
@@ -77,7 +78,7 @@ export function SharedMountsSettings({ mounts: initialMounts, onSave, plugin }: 
     const candidateMounts = editingIndex === null
       ? [...mounts, { enabled: true, localPath: normalizedPath, vaultId: form.vaultId.trim(), token: form.token.trim() }]
       : mounts.map((mount, index) => index === editingIndex
-        ? { ...mount, enabled: mount.enabled ?? true, localPath: normalizedPath, vaultId: form.vaultId.trim(), token: form.token.trim() }
+        ? { ...mount, enabled: isSharedMountEnabled(mount), localPath: normalizedPath, vaultId: form.vaultId.trim(), token: form.token.trim() }
         : mount);
     const overlapValidation = validateSharedMountOverlaps(candidateMounts);
     if (!overlapValidation.ok) {
@@ -91,7 +92,7 @@ export function SharedMountsSettings({ mounts: initialMounts, onSave, plugin }: 
   const submit = () => {
     if (!validate()) return;
     const mount: SharedDirectoryMount = {
-      enabled: editingIndex === null ? true : mounts[editingIndex].enabled ?? true,
+      enabled: editingIndex === null ? true : isSharedMountEnabled(mounts[editingIndex]),
       localPath: normalizeVaultPath(form.localPath),
       vaultId: form.vaultId.trim(),
       token: form.token.trim(),
@@ -150,17 +151,17 @@ export function SharedMountsSettings({ mounts: initialMounts, onSave, plugin }: 
             <span className="salt-sync-mount-path">{mount.localPath}/</span>
             <span className="salt-sync-mount-meta">
               → {mount.vaultId}
-              {mount.enabled === false ? ' [已停用]' : ''}
+              {!isSharedMountEnabled(mount) ? ' [已停用]' : ''}
               {mount.readOnly ? ' [只读]' : ''}
               {mount.serverUrl ? ` (${mount.serverUrl})` : ''}
             </span>
-            {plugin && mount.enabled !== false && (
+            {plugin && isSharedMountEnabled(mount) && (
               <MountStatusBadge plugin={plugin} vaultId={mount.vaultId} />
             )}
           </div>
           <div className="salt-sync-mount-actions">
             <Toggle
-              checked={mount.enabled !== false}
+              checked={isSharedMountEnabled(mount)}
               onChange={(enabled) => toggleEnabled(i, enabled)}
               ariaLabel={`${mount.localPath} 挂载同步开关`}
             />
